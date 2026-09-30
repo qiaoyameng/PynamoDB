@@ -19,6 +19,9 @@ High Level API
 .. automodule:: pynamodb.pagination
     :members:
 
+.. automodule:: pynamodb.streams
+    :members:
+
 Low Level API
 -------------
 

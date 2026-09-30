@@ -44,6 +44,7 @@ from pynamodb.types import HASH, RANGE
 from pynamodb.indexes import Index
 from pynamodb.pagination import ResultIterator
 from pynamodb.settings import get_settings_value
+from pynamodb.streams import StreamRecord, decode_stream_record
 from pynamodb import constants
 from pynamodb.constants import (
     ATTR_NAME, ATTR_TYPE,
@@ -565,6 +566,32 @@ class Model(AttributeContainer, metaclass=MetaModel):
             raise ValueError("Received no data to construct object")
 
         return cls._instantiate(data)
+
+    @classmethod
+    def from_stream_record(
+        cls: Type[_T],
+        record: Dict[str, Any],
+        keep_unknown_attributes: bool = False,
+    ) -> StreamRecord[_T]:
+        """
+        Decodes a DynamoDB Streams record into a :class:`~pynamodb.streams.StreamRecord`,
+        hydrating the old image, new image and keys (whichever are present) into
+        instances of this class.
+
+        A missing image (e.g. no ``OldImage`` on an ``INSERT`` event) is represented
+        as :code:`None`; no model instance with default values is fabricated for it.
+        Decoded instances only contain the attributes actually present in the image.
+
+        :param record: a stream record as returned by ``dynamodbstreams.get_records``
+          or delivered to a Lambda function (the full record, or just its ``dynamodb`` body)
+        :param keep_unknown_attributes: if :code:`True`, attributes present in an image
+          but not declared on the model (e.g. after the model's fields have changed)
+          are preserved in their raw form on the decoded instance's
+          :code:`_unknown_attributes` dictionary; otherwise they are silently dropped
+        :raises pynamodb.exceptions.StreamRecordDeserializationError: if an attribute
+          fails to deserialize; the exception carries the image and attribute path
+        """
+        return decode_stream_record(cls, record, keep_unknown_attributes=keep_unknown_attributes)
 
     @classmethod
     def count(

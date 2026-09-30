@@ -211,6 +211,22 @@ class AttributeNullError(ValueError):
         self.attr_path = attr_name + '.' + self.attr_path
 
 
+class StreamRecordDeserializationError(PynamoDBException):
+    """
+    Raised when an image in a DynamoDB Streams record cannot be deserialized into a model.
+
+    Carries the :code:`image` ('old_image', 'new_image' or 'keys') and the
+    :code:`attr_path` (e.g. 'address.zip_code') of the attribute that failed to deserialize.
+    """
+    msg = "Failed to deserialize stream record"
+
+    def __init__(self, image: str, attr_path: str, cause: Optional[Exception] = None) -> None:
+        self.image = image
+        self.attr_path = attr_path
+        msg = "Failed to deserialize '{}' from stream record {}: {}".format(attr_path, image, cause)
+        super(StreamRecordDeserializationError, self).__init__(msg, cause=cause)
+
+
 class VerboseClientError(botocore.exceptions.ClientError):
     def __init__(
         self,
