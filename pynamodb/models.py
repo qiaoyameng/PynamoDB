@@ -40,6 +40,7 @@ from pynamodb.attributes import (
 )
 from pynamodb.connection.table import TableConnection
 from pynamodb.expressions.condition import Condition
+from pynamodb.expressions.projection import get_projection_document_paths
 from pynamodb.types import HASH, RANGE
 from pynamodb.indexes import Index
 from pynamodb.pagination import ResultIterator
@@ -90,6 +91,12 @@ class BatchWrite(Generic[_T]):
 
         :param put_item: Should be an instance of a `Model` to be written
         """
+        if not put_item._is_fully_loaded():
+            raise InvalidStateError(
+                "Cannot batch write a partially loaded instance: it was created from a projection and "
+                "saving it would delete attributes that were not loaded. Call `refresh` to load the "
+                "entire item or load the missing attributes with `refresh_fields`."
+            )
         if len(self.pending_operations) == self.max_operations:
             if not self.auto_commit:
                 raise ValueError("DynamoDB allows a maximum of 25 batch operations")
@@ -330,6 +337,9 @@ class Model(AttributeContainer, metaclass=MetaModel):
             tuples if range keys are used.
         """
         items = set(items)
+        map_fn = cls.from_raw_data
+        if attributes_to_get is not None:
+            map_fn = lambda data: cls._from_raw_data_with_projection(data, attributes_to_get)  # noqa: E731
         hash_key_attribute = cls._hash_key_attribute()
         range_key_attribute = cls._range_key_attribute()
         keys_to_get: List[Any] = []
@@ -342,7 +352,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
                         attributes_to_get=attributes_to_get,
                     )
                     for batch_item in page:
-                        yield cls.from_raw_data(batch_item)
+                        yield map_fn(batch_item)
                     if unprocessed_keys:
                         keys_to_get = unprocessed_keys
                     else:
@@ -375,7 +385,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 attributes_to_get=attributes_to_get,
             )
             for batch_item in page:
-                yield cls.from_raw_data(batch_item)
+                yield map_fn(batch_item)
             if unprocessed_keys:
                 keys_to_get = unprocessed_keys
             else:
@@ -440,11 +450,30 @@ class Model(AttributeContainer, metaclass=MetaModel):
         self.deserialize(item_data)
         return data
 
-    def save(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Dict[str, Any]:
+    def save(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        allow_partial_save: bool = False,
+    ) -> Dict[str, Any]:
         """
         Save this object to dynamodb
+
+        :param condition: If set, a condition
+        :param add_version_condition: For models which have a :class:`~pynamodb.attributes.VersionAttribute`,
+          specifies whether the item should only be saved if its current version matches the expected one.
+          Set to `False` for a 'last-write-wins' strategy.
+        :param allow_partial_save: If `True`, allows saving an instance that was loaded with a partial
+          projection, overwriting the entire item with only the loaded attributes. Defaults to `False`:
+          saving a partially loaded instance raises :class:`~pynamodb.exceptions.InvalidStateError`
+          so that attributes that were never read are not accidentally deleted.
         """
-        args, kwargs = self._get_save_args(condition=condition, add_version_condition=add_version_condition)
+        args, kwargs = self._get_save_args(
+            condition=condition,
+            add_version_condition=add_version_condition,
+            allow_partial_save=allow_partial_save,
+        )
         data = self._get_connection().put_item(*args, **kwargs)
         self.update_local_version_attribute()
         return data
@@ -466,6 +495,44 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if stored_cls and stored_cls != type(self):
             raise ValueError("Cannot refresh this item from the returned class: {}".format(stored_cls.__name__))
         self.deserialize(item_data)
+
+    def refresh_fields(self, *attributes_to_get: Any, consistent_read: bool = False) -> None:
+        """
+        Loads the specified attributes (document paths) from DynamoDB and merges them into this
+        instance, marking them as loaded. This is primarily useful for instances that were created
+        from a partial projection (see `attributes_to_get`): accessing an attribute that was not
+        loaded raises :class:`~pynamodb.exceptions.AttributeNotLoadedError`, and `refresh_fields`
+        can be used to backfill specific attributes without reloading the entire item.
+
+        :param attributes_to_get: One or more attributes to load. Each attribute can be a document
+          path string (e.g. ``'foo.bar'``), an :class:`~pynamodb.attributes.Attribute`, or a
+          :class:`~pynamodb.expressions.operand.Path`. A single list of attributes is also accepted.
+        :param consistent_read: If True, then a consistent read is performed.
+        :raises ModelInstance.DoesNotExist: if the object to be updated does not exist
+        """
+        attributes_to_get = tuple(
+            attribute
+            for argument in attributes_to_get
+            for attribute in (argument if isinstance(argument, (list, tuple)) else (argument,))
+        )
+        if not attributes_to_get:
+            raise ValueError("refresh_fields requires at least one attribute to load")
+
+        hk_value, rk_value = self._get_hash_range_key_serialized_values()
+        attrs = self._get_connection().get_item(
+            hk_value,
+            range_key=rk_value,
+            consistent_read=consistent_read,
+            attributes_to_get=list(attributes_to_get),
+        )
+        item_data = attrs.get(ITEM, None)
+        if item_data is None:
+            raise self.DoesNotExist("This item does not exist in the table.")
+        stored_cls = self._get_discriminator_class(item_data)
+        if stored_cls and stored_cls != type(self):
+            raise ValueError("Cannot refresh this item from the returned class: {}".format(stored_cls.__name__))
+        fresh = type(self)._from_raw_data_with_projection(item_data, list(attributes_to_get))
+        self._merge_loaded_attributes(fresh)
 
     def get_update_kwargs_from_instance(
         self,
@@ -539,6 +606,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param attributes_to_get:
         :raises ModelInstance.DoesNotExist: if the object to be updated does not exist
         """
+        unserialized_hash_key, unserialized_range_key = hash_key, range_key
         hash_key, range_key = cls._serialize_keys(hash_key, range_key)
 
         data = cls._get_connection().get_item(
@@ -550,6 +618,14 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if data:
             item_data = data.get(ITEM)
             if item_data:
+                if attributes_to_get is not None:
+                    item = cls._from_raw_data_with_projection(item_data, attributes_to_get)
+                    # The key values are known from the request even when they are not projected,
+                    # so operations that require them (e.g. `refresh_fields`) keep working.
+                    setattr(item, cls._hash_keyname, unserialized_hash_key)  # type: ignore
+                    if cls._range_keyname and unserialized_range_key is not None:
+                        setattr(item, cls._range_keyname, unserialized_range_key)
+                    return item
                 return cls.from_raw_data(item_data)
         raise cls.DoesNotExist()
 
@@ -565,6 +641,18 @@ class Model(AttributeContainer, metaclass=MetaModel):
             raise ValueError("Received no data to construct object")
 
         return cls._instantiate(data)
+
+    @classmethod
+    def _from_raw_data_with_projection(cls: Type[_T], data: Dict[str, Any], attributes_to_get) -> _T:
+        """
+        Returns an instance of this class from the raw data returned by a projected read,
+        tracking which attributes were loaded so that accessing any other attribute raises
+        :class:`~pynamodb.exceptions.AttributeNotLoadedError`.
+        """
+        if data is None:
+            raise ValueError("Received no data to construct object")
+
+        return cls._instantiate(data, projection=get_projection_document_paths(attributes_to_get))
 
     @classmethod
     def count(
@@ -681,11 +769,15 @@ class Model(AttributeContainer, metaclass=MetaModel):
             attributes_to_get=attributes_to_get,
         )
 
+        map_fn = cls.from_raw_data
+        if attributes_to_get is not None:
+            map_fn = lambda data: cls._from_raw_data_with_projection(data, attributes_to_get)  # noqa: E731
+
         return ResultIterator(
             cls._get_connection().query,
             query_args,
             query_kwargs,
-            map_fn=cls.from_raw_data,
+            map_fn=map_fn,
             limit=limit,
             rate_limit=rate_limit,
         )
@@ -738,11 +830,15 @@ class Model(AttributeContainer, metaclass=MetaModel):
             attributes_to_get=attributes_to_get
         )
 
+        map_fn = cls.from_raw_data
+        if attributes_to_get is not None:
+            map_fn = lambda data: cls._from_raw_data_with_projection(data, attributes_to_get)  # noqa: E731
+
         return ResultIterator(
             cls._get_connection().scan,
             scan_args,
             scan_kwargs,
-            map_fn=cls.from_raw_data,
+            map_fn=map_fn,
             limit=limit,
             rate_limit=rate_limit,
         )
@@ -894,7 +990,13 @@ class Model(AttributeContainer, metaclass=MetaModel):
 
         return schema
 
-    def _get_save_args(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Tuple[Iterable[Any], Dict[str, Any]]:
+    def _get_save_args(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        allow_partial_save: bool = False,
+    ) -> Tuple[Iterable[Any], Dict[str, Any]]:
         """
         Gets the proper *args, **kwargs for saving and retrieving this object
 
@@ -904,7 +1006,17 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param add_version_condition: For models which have a :class:`~pynamodb.attributes.VersionAttribute`,
           specifies whether the item should only be saved if its current version matches the expected one.
           Set to `False` for a 'last-write-wins' strategy.
+        :param allow_partial_save: If `True`, allows saving an instance that was loaded with a partial
+          projection. Defaults to `False` so that a partially loaded instance cannot overwrite
+          (and thereby delete) attributes that were never read.
         """
+        if not allow_partial_save and not self._is_fully_loaded():
+            raise InvalidStateError(
+                "Cannot save a partially loaded instance: it was created from a projection and saving it "
+                "would delete attributes that were not loaded. Call `refresh` to load the entire item, "
+                "load the missing attributes with `refresh_fields`, use `update` for partial updates, "
+                "or pass `allow_partial_save=True` to save anyway."
+            )
         attribute_values = self.serialize(null_check=True)
         hash_key_attribute = self._hash_key_attribute()
         hash_key = attribute_values.pop(hash_key_attribute.attr_name, {}).get(hash_key_attribute.attr_type)

@@ -110,6 +110,37 @@ data loss, either avoid using `save()` or perform a multi-step update
 with the first step is to upgrade to a version that merely declares
 the attribute on the model without ever setting it to any value.
 
+.. _partial-projections:
+
+Partial projections
+^^^^^^^^^^^^^^^^^^^
+
+The ``attributes_to_get`` parameter of `get()`, `query()`, `scan()` and
+`batch_get()` reads only a subset of an item's attributes from DynamoDB.
+Because the resulting instance does not know whether the remaining
+attributes exist remotely, PynamoDB tracks which attributes were loaded:
+
+* Accessing an attribute that was not loaded raises
+  :class:`~pynamodb.exceptions.AttributeNotLoadedError` instead of
+  silently returning a default or ``None``.
+* Defaults are only applied to attributes that were projected and
+  confirmed to not exist remotely.
+* `save()` refuses to overwrite the item with a partially loaded
+  instance (so that attributes that were never read are not deleted),
+  unless ``allow_partial_save=True`` is passed explicitly. `update()`
+  can still be used to modify the attributes that are known.
+* Nested map attributes track the loading state of their elements
+  recursively when the projection only includes some of them.
+
+Use `refresh_fields()` to backfill specific attributes (including
+document paths into nested maps) without reloading the entire item, or
+`refresh()` to load the entire item::
+
+    user = UserModel.get('test@example.com', attributes_to_get=['email'])
+    user.first_name  # raises AttributeNotLoadedError
+    user.refresh_fields('first_name', 'address.street')
+    user.first_name  # 'Robert'
+
 Querying
 ^^^^^^^^
 

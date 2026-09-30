@@ -187,6 +187,14 @@ class InvalidStateError(PynamoDBException):
     msg = "Operation in invalid state"
 
 
+class AttributeNotLoadedError(InvalidStateError):
+    """
+    Raised when accessing an attribute that was not loaded from DynamoDB
+    because the model instance was created from a partial projection.
+    """
+    msg = "Attribute not loaded"
+
+
 class AttributeDeserializationError(TypeError):
     """
     Raised when attribute type is invalid during deserialization.

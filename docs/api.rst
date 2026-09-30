@@ -42,6 +42,7 @@ Exceptions
 .. autoexception:: pynamodb.exceptions.TransactWriteError
 .. autoexception:: pynamodb.exceptions.TransactGetError
 .. autoexception:: pynamodb.exceptions.InvalidStateError
+.. autoexception:: pynamodb.exceptions.AttributeNotLoadedError
 .. autoexception:: pynamodb.exceptions.AttributeDeserializationError
 .. autoexception:: pynamodb.exceptions.AttributeNullError
 .. autoclass:: pynamodb.exceptions.CancellationReason

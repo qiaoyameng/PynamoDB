@@ -34,6 +34,7 @@ from pynamodb.constants import NUMBER_SET
 from pynamodb.constants import STRING
 from pynamodb.constants import STRING_SET
 from pynamodb.exceptions import AttributeDeserializationError
+from pynamodb.exceptions import AttributeNotLoadedError
 from pynamodb.exceptions import AttributeNullError
 from pynamodb.expressions.operand import Path
 
@@ -60,6 +61,19 @@ _A = TypeVar('_A', bound='Attribute')
 
 _IMMUTABLE_TYPES = (str, int, float, datetime, timedelta, bytes, bool, tuple, frozenset, type(None), Enum)
 _IMMUTABLE_TYPE_NAMES = ', '.join(map(lambda x: x.__name__, _IMMUTABLE_TYPES))
+
+
+def _group_projection_paths(projection: List[List[str]]) -> Dict[str, List[List[str]]]:
+    """
+    Groups projected document paths by their first segment (a DynamoDB attribute name).
+    Each group contains the remaining segments of every path; an empty remainder means
+    the attribute itself was projected.
+    """
+    grouped: Dict[str, List[List[str]]] = {}
+    for path in projection:
+        if path:
+            grouped.setdefault(path[0], []).append(path[1:])
+    return grouped
 
 
 class Attribute(Generic[_T]):
@@ -147,6 +161,10 @@ class Attribute(Generic[_T]):
         if instance and not self._is_map_attribute_class_object(instance):
             attr_name = instance._dynamo_to_python_attrs.get(self.attr_name, self.attr_name)
             instance.attribute_values[attr_name] = value
+            loaded_attributes = instance._loaded_attributes
+            if loaded_attributes is not None:
+                # Explicitly setting an attribute marks it as loaded.
+                loaded_attributes.add(attr_name)
 
     @overload
     def __get__(self: _A, instance: None, owner: Any) -> _A: ...
@@ -161,6 +179,14 @@ class Attribute(Generic[_T]):
             return instance.__dict__.get(attr_name, None) or self
         elif instance:
             attr_name = instance._dynamo_to_python_attrs.get(self.attr_name, self.attr_name)
+            loaded_attributes = instance._loaded_attributes
+            if loaded_attributes is not None and attr_name not in loaded_attributes:
+                raise AttributeNotLoadedError(
+                    "Attribute '{}' was not loaded from DynamoDB: this instance was created "
+                    "from a partial projection that did not include it. "
+                    "Call `refresh_fields` to load specific attributes or `refresh` to load the entire item."
+                    .format(attr_name)
+                )
             return instance.attribute_values.get(attr_name, None)
         else:
             return self
@@ -329,10 +355,40 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
         # using the `python_attr_name` as the dictionary key. "Raw" (i.e. non-subclassed) MapAttribute
         # instances do not have any Attributes defined and instead use this dictionary to store their
         # collection of name-value pairs.
+        # The `_loaded_attributes` set tracks which attributes have been loaded from DynamoDB when the
+        # instance is created from a partial projection (see `attributes_to_get`). It is `None` when the
+        # instance is fully loaded (or user instantiated) and every attribute may be accessed.
+        self._set_loaded_attributes(None)
         self.attribute_values: Dict[str, Any] = {}
         self._set_discriminator()
         self._set_defaults(_user_instantiated=_user_instantiated)
         self._set_attributes(**attributes)
+
+    def _set_loaded_attributes(self, loaded_attributes: Optional[Set[str]]) -> None:
+        # NOTE: `object.__setattr__` is used because "raw" MapAttribute instances route
+        # `__setattr__` into `attribute_values`.
+        object.__setattr__(self, '_loaded_attributes', loaded_attributes)
+
+    def _is_fully_loaded(self) -> bool:
+        """
+        Returns True if this instance is not missing any loading state, i.e. it was not created
+        from a partial projection (or every attribute has since been loaded, recursively).
+        """
+        loaded_attributes = self._loaded_attributes
+        if loaded_attributes is None:
+            return True
+        attributes = self.get_attributes()
+        if not attributes:
+            # "Raw" maps have no declared attributes to compare against,
+            # so a tracked loading state always means the map may be incomplete.
+            return False
+        for name in attributes:
+            if name not in loaded_attributes:
+                return False
+            value = self.attribute_values.get(name)
+            if isinstance(value, MapAttribute) and value._is_attribute_container() and not value._is_fully_loaded():
+                return False
+        return True
 
     @classmethod
     def _get_attributes(cls) -> Dict[str, Attribute]:
@@ -383,6 +439,15 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
             if value is not None:
                 setattr(self, name, value)
 
+    def _set_default(self, name: str, attr: 'Attribute') -> None:
+        """
+        Sets the default value of a single attribute, if it provides one.
+        """
+        default = attr.default
+        value = default() if callable(default) else default
+        if value is not None:
+            setattr(self, name, value)
+
     def _set_attributes(self, **attributes: Attribute) -> None:
         """
         Sets the attributes for this object
@@ -397,7 +462,12 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
         Serialize attribute values for DynamoDB
         """
         attribute_values: Dict[str, Dict[str, Any]] = {}
+        loaded_attributes = self._loaded_attributes
         for name, attr in self.get_attributes().items():
+            if loaded_attributes is not None and name not in loaded_attributes:
+                # The instance was loaded with a partial projection:
+                # attributes that were not loaded cannot be serialized.
+                continue
             value = getattr(self, name)
             try:
                 if isinstance(value, MapAttribute) and not value.validate(null_check=null_check):
@@ -426,6 +496,7 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
         Sets attributes sent back from DynamoDB on this object
         """
         self.attribute_values = {}
+        self._set_loaded_attributes(None)
         self._set_discriminator()
         self._set_defaults(_user_instantiated=False)
         for name, attr in self.get_attributes().items():
@@ -433,6 +504,58 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
             if attribute_value and NULL not in attribute_value:
                 value = attr.deserialize(attr.get_value(attribute_value))
                 setattr(self, name, value)
+
+    def _container_deserialize_projected(
+        self,
+        attribute_values: Dict[str, Dict[str, Any]],
+        projection: List[List[str]],
+    ) -> None:
+        """
+        Sets attributes sent back from DynamoDB on this object, tracking which attributes
+        were actually loaded by the projection so that accessing any other attribute raises
+        :class:`~pynamodb.exceptions.AttributeNotLoadedError` instead of silently returning
+        a default (or ``None``) for a value that may exist remotely.
+
+        :param attribute_values: The (projected) DynamoDB attribute values.
+        :param projection: A list of document paths (each a list of DynamoDB attribute name segments)
+          that were requested from DynamoDB.
+        """
+        self.attribute_values = {}
+        self._set_loaded_attributes(set())
+        self._set_discriminator()
+        for dynamo_name, sub_paths in _group_projection_paths(projection).items():
+            name = self._dynamo_to_python_attr(dynamo_name)
+            attr = self.get_attributes().get(name)
+            if attr is None:
+                continue
+            attribute_value = attribute_values.get(attr.attr_name)
+            present = attribute_value is not None and NULL not in attribute_value
+            if any(not sub_path for sub_path in sub_paths):
+                # The entire attribute was projected.
+                self._loaded_attributes.add(name)
+                if present:
+                    setattr(self, name, attr.deserialize(attr.get_value(attribute_value)))
+                else:
+                    # The attribute is confirmed to not exist remotely, so its default applies.
+                    self._set_default(name, attr)
+            elif isinstance(attr, MapAttribute):
+                # Only some of the map's elements were projected: track the loading state recursively.
+                self._loaded_attributes.add(name)
+                nested_projection = [sub_path for sub_path in sub_paths if sub_path]
+                if present:
+                    map_value = attr.get_value(attribute_value)
+                    if attr.is_raw():
+                        setattr(self, name, attr.deserialize(map_value))
+                        child = self.attribute_values[name]
+                        # "Raw" maps have no declared attributes; track the projected top-level keys.
+                        child._set_loaded_attributes({path[0] for path in nested_projection})
+                    else:
+                        child = type(attr)._instantiate(map_value, projection=nested_projection)
+                        setattr(self, name, child)
+                else:
+                    self._set_default(name, attr)
+            # Projections that dereference list indexes or scalar attributes cannot be tracked
+            # conservatively, so those attributes are left unloaded.
 
     @classmethod
     def _update_attribute_types(cls, attribute_values: Dict[str, Dict[str, Any]]):
@@ -477,14 +600,50 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
         return None
 
     @classmethod
-    def _instantiate(cls: Type[_ACT], attribute_values: Dict[str, Dict[str, Any]]) -> _ACT:
+    def _instantiate(
+        cls: Type[_ACT],
+        attribute_values: Dict[str, Dict[str, Any]],
+        projection: Optional[List[List[str]]] = None,
+    ) -> _ACT:
         stored_cls = cls._get_discriminator_class(attribute_values)
         if stored_cls and not issubclass(stored_cls, cls):
             raise ValueError("Cannot instantiate a {} from the returned class: {}".format(
                 cls.__name__, stored_cls.__name__))
         instance = (stored_cls or cls)(_user_instantiated=False)
-        AttributeContainer._container_deserialize(instance, attribute_values)
+        if projection is None:
+            AttributeContainer._container_deserialize(instance, attribute_values)
+        else:
+            AttributeContainer._container_deserialize_projected(instance, attribute_values, projection)
         return instance
+
+    def _merge_loaded_attributes(self, other: 'AttributeContainer') -> None:
+        """
+        Merges the attribute values of `other` (an instance of the same class, typically loaded
+        with a projection) into this instance, updating the loading state so that attributes
+        loaded into `other` become accessible on this instance as well.
+        """
+        other_loaded = other._loaded_attributes
+        if other_loaded is None:
+            object.__setattr__(self, 'attribute_values', dict(other.attribute_values))
+            self._set_loaded_attributes(None)
+            return
+        tracking = self._loaded_attributes is not None
+        for name in other_loaded:
+            if tracking:
+                self._loaded_attributes.add(name)  # type: ignore
+            new_value = other.attribute_values.get(name)
+            old_value = self.attribute_values.get(name)
+            if (isinstance(new_value, MapAttribute) and new_value._is_attribute_container()
+                    and isinstance(old_value, MapAttribute) and old_value._is_attribute_container()
+                    and new_value._loaded_attributes is not None):
+                # Both values are maps and the new value is partially loaded:
+                # merge recursively so previously loaded elements are preserved.
+                old_value._merge_loaded_attributes(new_value)
+            elif name in other.attribute_values:
+                self.attribute_values[name] = new_value
+            else:
+                # The attribute was projected but does not exist remotely (and has no default).
+                self.attribute_values.pop(name, None)
 
     def to_dynamodb_dict(self) -> Dict[str, Dict[str, Any]]:
         """
@@ -1064,6 +1223,14 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
 
     def __getitem__(self, item: _KT) -> _VT:  # type: ignore
         if self._is_attribute_container():
+            loaded_attributes = self.__dict__.get('_loaded_attributes')
+            if loaded_attributes is not None and item not in loaded_attributes:
+                raise AttributeNotLoadedError(
+                    "Attribute '{}' was not loaded from DynamoDB: this instance was created "
+                    "from a partial projection that did not include it. "
+                    "Call `refresh_fields` to load specific attributes or `refresh` to load the entire item."
+                    .format(item)
+                )
             return self.attribute_values[item]
         # If this instance is being used as an Attribute, treat item access like the map dereference operator.
         # This provides equivalence between DynamoDB's nested attribute access for map elements (MyMap.nestedField)
@@ -1082,6 +1249,9 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
             setattr(self, item, value)
         elif self.is_raw():
             self.attribute_values[item] = value
+            loaded_attributes = self.__dict__.get('_loaded_attributes')
+            if loaded_attributes is not None:
+                loaded_attributes.add(item)
         else:
             raise AttributeError("'{}' has no attribute '{}'".format(self.__class__.__name__, item))
 
@@ -1089,6 +1259,14 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
         # This should only be called for "raw" (i.e. non-subclassed) MapAttribute instances.
         # MapAttribute subclasses should access attributes via the Attribute descriptors.
         if self.is_raw() and self._is_attribute_container():
+            loaded_attributes = self.__dict__.get('_loaded_attributes')
+            if loaded_attributes is not None and attr not in loaded_attributes:
+                raise AttributeNotLoadedError(
+                    "Attribute '{}' was not loaded from DynamoDB: this instance was created "
+                    "from a partial projection that did not include it. "
+                    "Call `refresh_fields` to load specific attributes or `refresh` to load the entire item."
+                    .format(attr)
+                )
             try:
                 return self.attribute_values[attr]
             except KeyError:
@@ -1108,6 +1286,9 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
         # MapAttribute subclasses should set attributes via the Attribute descriptors.
         if self.is_raw() and self._is_attribute_container():
             self.attribute_values[name] = value
+            loaded_attributes = self.__dict__.get('_loaded_attributes')
+            if loaded_attributes is not None:
+                loaded_attributes.add(name)
         else:
             object.__setattr__(self, name, value)
 
@@ -1149,8 +1330,10 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
         return True  # TODO: check that the actual type of `value` meets requirements of `attr`
 
     def validate(self, *, null_check: bool = False):
+        loaded_attributes = self._loaded_attributes
         return all(self.is_correctly_typed(k, v, null_check=null_check)
-                   for k, v in self.get_attributes().items())
+                   for k, v in self.get_attributes().items()
+                   if loaded_attributes is None or k in loaded_attributes)
 
     def _serialize_undeclared_attributes(self, values, container: Dict):
         # Continue to serialize NULL values in "raw" map attributes for backwards compatibility.
