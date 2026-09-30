@@ -9,6 +9,7 @@ import sys
 from copy import deepcopy
 from inspect import getmembers
 from typing import Any
+from typing import Callable
 from typing import Dict
 from typing import Generic
 from typing import Iterable
@@ -34,12 +35,13 @@ else:
 
 from pynamodb.expressions.update import Action
 from pynamodb.exceptions import DoesNotExist, TableDoesNotExist, TableError, InvalidStateError, PutError, \
-    AttributeNullError
+    AttributeNullError, AttributeNotLoadedError
 from pynamodb.attributes import (
     AttributeContainer, AttributeContainerMeta, TTLAttribute, VersionAttribute
 )
 from pynamodb.connection.table import TableConnection
 from pynamodb.expressions.condition import Condition
+from pynamodb.expressions.projection import _get_document_path
 from pynamodb.types import HASH, RANGE
 from pynamodb.indexes import Index
 from pynamodb.pagination import ResultIterator
@@ -66,6 +68,16 @@ log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
 
 
+def _get_document_paths(attributes_to_get: Any) -> List[List[str]]:
+    """
+    Normalizes an ``attributes_to_get`` value into a list of document paths
+    (each a list of path segments), mirroring how the projection expression is built.
+    """
+    if not isinstance(attributes_to_get, list):
+        attributes_to_get = [attributes_to_get]
+    return [_get_document_path(attribute) for attribute in attributes_to_get]
+
+
 class BatchWrite(Generic[_T]):
     """
     A class for batch writes
@@ -90,6 +102,7 @@ class BatchWrite(Generic[_T]):
 
         :param put_item: Should be an instance of a `Model` to be written
         """
+        put_item._raise_if_partial()
         if len(self.pending_operations) == self.max_operations:
             if not self.auto_commit:
                 raise ValueError("DynamoDB allows a maximum of 25 batch operations")
@@ -330,6 +343,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
             tuples if range keys are used.
         """
         items = set(items)
+        projection = _get_document_paths(attributes_to_get) if attributes_to_get is not None else None
         hash_key_attribute = cls._hash_key_attribute()
         range_key_attribute = cls._range_key_attribute()
         keys_to_get: List[Any] = []
@@ -342,7 +356,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
                         attributes_to_get=attributes_to_get,
                     )
                     for batch_item in page:
-                        yield cls.from_raw_data(batch_item)
+                        yield cls.from_raw_data(batch_item, projection=projection)
                     if unprocessed_keys:
                         keys_to_get = unprocessed_keys
                     else:
@@ -375,7 +389,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 attributes_to_get=attributes_to_get,
             )
             for batch_item in page:
-                yield cls.from_raw_data(batch_item)
+                yield cls.from_raw_data(batch_item, projection=projection)
             if unprocessed_keys:
                 keys_to_get = unprocessed_keys
             else:
@@ -440,14 +454,36 @@ class Model(AttributeContainer, metaclass=MetaModel):
         self.deserialize(item_data)
         return data
 
-    def save(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Dict[str, Any]:
+    def save(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        allow_partial: bool = False,
+    ) -> Dict[str, Any]:
         """
         Save this object to dynamodb
+
+        :param allow_partial: By default, saving an instance that was loaded with a partial
+          projection raises :class:`~pynamodb.exceptions.AttributeNotLoadedError`, since the
+          PutItem operation would overwrite the entire item and delete attributes that were
+          never loaded. Set to `True` to save only the loaded attributes anyway.
         """
+        if not allow_partial:
+            self._raise_if_partial()
         args, kwargs = self._get_save_args(condition=condition, add_version_condition=add_version_condition)
         data = self._get_connection().put_item(*args, **kwargs)
         self.update_local_version_attribute()
         return data
+
+    def _raise_if_partial(self) -> None:
+        if self._is_partial():
+            raise AttributeNotLoadedError(
+                "Cannot save {} because it was loaded with a partial projection; saving would "
+                "overwrite the entire item and delete attributes that were never loaded. Call "
+                "refresh() or refresh_fields() to load the full item first, use update() to "
+                "modify specific attributes, or pass allow_partial=True to save() to save only "
+                "the loaded attributes.".format(type(self).__name__))
 
     def refresh(self, consistent_read: bool = False) -> None:
         """
@@ -466,6 +502,29 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if stored_cls and stored_cls != type(self):
             raise ValueError("Cannot refresh this item from the returned class: {}".format(stored_cls.__name__))
         self.deserialize(item_data)
+
+    def refresh_fields(self, fields: Iterable[Any], consistent_read: bool = False) -> None:
+        """
+        Loads the specified attributes from DynamoDB onto this instance, which is useful
+        after loading an instance with a partial projection (see ``attributes_to_get``).
+
+        :param fields: The attributes to load, in the same format as ``attributes_to_get``:
+          attribute names or document paths (e.g. ``['email', 'my_map.my_field']``)
+        :param consistent_read: If True, then a consistent read is performed.
+        :raises ModelInstance.DoesNotExist: if the object does not exist
+        """
+        projection = _get_document_paths(fields)
+        hk_value, rk_value = self._get_hash_range_key_serialized_values()
+        attrs = self._get_connection().get_item(
+            hk_value,
+            range_key=rk_value,
+            consistent_read=consistent_read,
+            attributes_to_get=fields,
+        )
+        item_data = attrs.get(ITEM, None)
+        if item_data is None:
+            raise self.DoesNotExist("This item does not exist in the table.")
+        self._load_projected_data(item_data, projection)
 
     def get_update_kwargs_from_instance(
         self,
@@ -503,6 +562,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         condition: Optional[Condition] = None,
         return_values_on_condition_failure: Optional[str] = None,
     ) -> Dict[str, Any]:
+        self._raise_if_partial()
         args, save_kwargs = self._get_save_args(condition=condition)
         save_kwargs['key'] = ITEM
         save_kwargs['return_values_on_condition_failure'] = return_values_on_condition_failure
@@ -539,6 +599,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         :param attributes_to_get:
         :raises ModelInstance.DoesNotExist: if the object to be updated does not exist
         """
+        hash_key_value, range_key_value = hash_key, range_key
         hash_key, range_key = cls._serialize_keys(hash_key, range_key)
 
         data = cls._get_connection().get_item(
@@ -550,21 +611,39 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if data:
             item_data = data.get(ITEM)
             if item_data:
+                if attributes_to_get is not None:
+                    item = cls._instantiate(item_data, projection=_get_document_paths(attributes_to_get))
+                    if cls._hash_keyname is not None:
+                        setattr(item, cls._hash_keyname, hash_key_value)
+                        item._mark_loaded(cls._hash_keyname)
+                    if cls._range_keyname is not None:
+                        setattr(item, cls._range_keyname, range_key_value)
+                        item._mark_loaded(cls._range_keyname)
+                    return item
                 return cls.from_raw_data(item_data)
         raise cls.DoesNotExist()
 
     @classmethod
-    def from_raw_data(cls: Type[_T], data: Dict[str, Any]) -> _T:
+    def from_raw_data(cls: Type[_T], data: Dict[str, Any], projection: Optional[List[List[str]]] = None) -> _T:
         """
         Returns an instance of this class
         from the raw data
 
         :param data: A serialized DynamoDB object
+        :param projection: When set, the document paths (each a list of path segments) that were
+            projected by the read operation; attributes outside the projection are left unloaded
         """
         if data is None:
             raise ValueError("Received no data to construct object")
 
-        return cls._instantiate(data)
+        return cls._instantiate(data, projection=projection)
+
+    @classmethod
+    def _get_projection_map_fn(cls: Type[_T], attributes_to_get: Any) -> Callable[[Dict[str, Any]], _T]:
+        if attributes_to_get is None:
+            return cls.from_raw_data
+        projection = _get_document_paths(attributes_to_get)
+        return lambda data: cls.from_raw_data(data, projection=projection)
 
     @classmethod
     def count(
@@ -685,7 +764,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
             cls._get_connection().query,
             query_args,
             query_kwargs,
-            map_fn=cls.from_raw_data,
+            map_fn=cls._get_projection_map_fn(attributes_to_get),
             limit=limit,
             rate_limit=rate_limit,
         )
@@ -742,7 +821,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
             cls._get_connection().scan,
             scan_args,
             scan_kwargs,
-            map_fn=cls.from_raw_data,
+            map_fn=cls._get_projection_map_fn(attributes_to_get),
             limit=limit,
             rate_limit=rate_limit,
         )
@@ -946,6 +1025,10 @@ class Model(AttributeContainer, metaclass=MetaModel):
         """
         if self._version_attribute_name is None:
             return None
+        if not self._is_attribute_loaded(self._version_attribute_name):
+            if actions is not None:
+                actions.append(self.get_attributes()[self._version_attribute_name].add(1))
+            return None
 
         version_attribute = self.get_attributes()[self._version_attribute_name]
         value = getattr(self, self._version_attribute_name)
@@ -966,7 +1049,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
         return condition
 
     def update_local_version_attribute(self):
-        if self._version_attribute_name is not None:
+        if self._version_attribute_name is not None and self._is_attribute_loaded(self._version_attribute_name):
             value = getattr(self, self._version_attribute_name, None) or 0
             setattr(self, self._version_attribute_name, value + 1)
 
