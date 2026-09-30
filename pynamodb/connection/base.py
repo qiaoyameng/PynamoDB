@@ -368,6 +368,8 @@ class Connection(object):
             cancellation_reasons = e.response.get('CancellationReasons', [])
 
             botocore_props = {'Error': e.response.get('Error', {})}
+            if e.response.get(ITEM) is not None:
+                botocore_props[ITEM] = e.response[ITEM]
             verbose_props = {
                 'request_id': resp_metadata.get('x-amzn-requestid', ''),
                 'table_name': self._get_table_name_for_error_context(operation_kwargs),
@@ -769,7 +771,7 @@ class Connection(object):
         """
         Builds the return values map that is common to several operations
         """
-        if return_values_on_condition_failure.upper() not in RETURN_VALUES_VALUES:
+        if return_values_on_condition_failure.upper() not in RETURN_VALUES_ON_CONDITION_FAILURE_VALUES:
             raise ValueError("{} must be one of {}".format(
                 RETURN_VALUES_ON_CONDITION_FAILURE,
                 RETURN_VALUES_ON_CONDITION_FAILURE_VALUES
@@ -835,7 +837,11 @@ class Connection(object):
         if return_values is not None:
             operation_kwargs.update(self.get_return_values_map(return_values))
         if return_values_on_condition_failure is not None:
-            operation_kwargs.update(self.get_return_values_on_condition_failure_map(return_values_on_condition_failure))
+            operation_kwargs.update(
+                self.get_return_values_on_condition_failure_map(
+                    return_values_on_condition_failure
+                )
+            )
         if return_consumed_capacity is not None:
             operation_kwargs.update(self.get_consumed_capacity_map(return_consumed_capacity))
         if return_item_collection_metrics is not None:
@@ -859,6 +865,7 @@ class Connection(object):
         range_key: Optional[str] = None,
         condition: Optional[Condition] = None,
         return_values: Optional[str] = None,
+        return_values_on_condition_failure: Optional[str] = None,
         return_consumed_capacity: Optional[str] = None,
         return_item_collection_metrics: Optional[str] = None,
     ) -> Dict:
@@ -871,6 +878,7 @@ class Connection(object):
             range_key=range_key,
             condition=condition,
             return_values=return_values,
+            return_values_on_condition_failure=return_values_on_condition_failure,
             return_consumed_capacity=return_consumed_capacity,
             return_item_collection_metrics=return_item_collection_metrics
         )
@@ -889,6 +897,7 @@ class Connection(object):
         return_consumed_capacity: Optional[str] = None,
         return_item_collection_metrics: Optional[str] = None,
         return_values: Optional[str] = None,
+        return_values_on_condition_failure: Optional[str] = None,
     ) -> Dict:
         """
         Performs the UpdateItem operation
@@ -903,6 +912,7 @@ class Connection(object):
             actions=actions,
             condition=condition,
             return_values=return_values,
+            return_values_on_condition_failure=return_values_on_condition_failure,
             return_consumed_capacity=return_consumed_capacity,
             return_item_collection_metrics=return_item_collection_metrics,
         )
@@ -919,6 +929,7 @@ class Connection(object):
         attributes: Optional[Any] = None,
         condition: Optional[Condition] = None,
         return_values: Optional[str] = None,
+        return_values_on_condition_failure: Optional[str] = None,
         return_consumed_capacity: Optional[str] = None,
         return_item_collection_metrics: Optional[str] = None,
     ) -> Dict:
@@ -933,6 +944,7 @@ class Connection(object):
             attributes=attributes,
             condition=condition,
             return_values=return_values,
+            return_values_on_condition_failure=return_values_on_condition_failure,
             return_consumed_capacity=return_consumed_capacity,
             return_item_collection_metrics=return_item_collection_metrics
         )
@@ -966,30 +978,33 @@ class Connection(object):
         client_request_token: Optional[str] = None,
         return_consumed_capacity: Optional[str] = None,
         return_item_collection_metrics: Optional[str] = None,
+        *,
+        transact_items: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict:
         """
         Performs the TransactWrite operation and returns the result
         """
-        transact_items: List[Dict] = []
-        transact_items.extend(
-            {TRANSACT_CONDITION_CHECK: item} for item in condition_check_items
-        )
-        transact_items.extend(
-            {TRANSACT_DELETE: item} for item in delete_items
-        )
-        transact_items.extend(
-            {TRANSACT_PUT: item} for item in put_items
-        )
-        transact_items.extend(
-            {TRANSACT_UPDATE: item} for item in update_items
-        )
+        if transact_items is None:
+            transact_items = []
+            transact_items.extend(
+                {TRANSACT_CONDITION_CHECK: item} for item in condition_check_items
+            )
+            transact_items.extend(
+                {TRANSACT_DELETE: item} for item in delete_items
+            )
+            transact_items.extend(
+                {TRANSACT_PUT: item} for item in put_items
+            )
+            transact_items.extend(
+                {TRANSACT_UPDATE: item} for item in update_items
+            )
 
         operation_kwargs = self._get_transact_operation_kwargs(
             client_request_token=client_request_token,
             return_consumed_capacity=return_consumed_capacity,
             return_item_collection_metrics=return_item_collection_metrics
         )
-        operation_kwargs[TRANSACT_ITEMS] = transact_items
+        operation_kwargs[TRANSACT_ITEMS] = list(transact_items)
 
         try:
             return self.dispatch(TRANSACT_WRITE_ITEMS, operation_kwargs)

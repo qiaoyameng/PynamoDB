@@ -158,5 +158,21 @@ You can check for conditional operation failures by inspecting the cause of the 
     try:
         thread_item.save(Thread.forum_name.exists())
     except PutError as e:
-        if e.cause_response_code = "ConditionalCheckFailedException":
+        if e.cause_response_code == "ConditionalCheckFailedException":
             raise ThreadDidNotExistError()
+
+Pass :code:`return_values_on_condition_failure='ALL_OLD'` to :meth:`~pynamodb.models.Model.save`,
+:meth:`~pynamodb.models.Model.update`, or :meth:`~pynamodb.models.Model.delete` to include the item as it existed
+immediately before the failed conditional write. The decoded model is available as :code:`item`; the original
+DynamoDB AttributeValue map remains available on the underlying error if it is needed.
+
+.. code-block:: python
+
+    try:
+        thread_item.save(
+            Thread.views == expected_views,
+            return_values_on_condition_failure='ALL_OLD',
+        )
+    except PutError as e:
+        if e.cause_response_code == "ConditionalCheckFailedException" and e.item:
+            show_conflict(current=e.item, attempted=thread_item)

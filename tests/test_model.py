@@ -14,7 +14,14 @@ from botocore.client import ClientError
 import pytest
 
 from .deep_eq import deep_eq
-from pynamodb.exceptions import DoesNotExist, TableError, PutError, AttributeDeserializationError
+from pynamodb.exceptions import (
+    AttributeDeserializationError,
+    DeleteError,
+    DoesNotExist,
+    PutError,
+    TableError,
+    UpdateError,
+)
 from pynamodb.constants import (
     ITEM, STRING, ALL, KEYS_ONLY, INCLUDE, REQUEST_ITEMS, UNPROCESSED_KEYS, CAMEL_COUNT,
     RESPONSES, KEYS, ITEMS, LAST_EVALUATED_KEY, EXCLUSIVE_START_KEY, ATTRIBUTES, BINARY,
@@ -3264,6 +3271,90 @@ def test_model_version_attribute_save(add_version_condition: bool) -> None:
             })
 
         assert args == params
+
+
+@pytest.mark.parametrize('method_name,actions,error_cls', [
+    ('save', None, PutError),
+    ('update', [VersionedModel.email.set('conflict@email.com')], UpdateError),
+    ('delete', None, DeleteError),
+])
+def test_conditional_write_failure_returns_old_item_without_local_version_update(
+    method_name: str,
+    actions,
+    error_cls,
+) -> None:
+    item = VersionedModel('test_user_name', email='old@email.com', version=3)
+    raw_item = {
+        'name': {'S': 'test_user_name'},
+        'email': {'S': 'persisted@email.com'},
+        'version': {'N': '3'},
+    }
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = ClientError(
+            {
+                'Error': {
+                    'Code': 'ConditionalCheckFailedException',
+                    'Message': 'The conditional request failed',
+                },
+                'Item': raw_item,
+            },
+            method_name,
+        )
+        with pytest.raises(error_cls) as exc_info:
+            if method_name == 'save':
+                item.save(return_values_on_condition_failure='ALL_OLD')
+            elif method_name == 'update':
+                item.update(actions, return_values_on_condition_failure='ALL_OLD')
+            else:
+                item.delete(return_values_on_condition_failure='ALL_OLD')
+
+    assert req.call_args[0][1]['ReturnValuesOnConditionCheckFailure'] == 'ALL_OLD'
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert isinstance(exc_info.value.item, VersionedModel)
+    assert exc_info.value.item is not item
+    assert exc_info.value.item.name == 'test_user_name'
+    assert exc_info.value.item.email == 'persisted@email.com'
+    assert exc_info.value.item.version == 3
+    assert item.email == 'old@email.com'
+    assert item.version == 3
+
+
+def test_conditional_write_failure_without_item_does_not_construct_model() -> None:
+    item = VersionedModel('test_user_name', email='old@email.com', version=3)
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = ClientError(
+            {'Error': {'Code': 'ConditionalCheckFailedException'}},
+            'PutItem',
+        )
+        with pytest.raises(PutError) as exc_info:
+            item.save(return_values_on_condition_failure='ALL_OLD')
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert exc_info.value.item is None
+    assert item.version == 3
+
+
+def test_conditional_write_failure_with_invalid_item_preserves_error() -> None:
+    item = VersionedModel('test_user_name', email='old@email.com', version=3)
+    raw_item = {
+        'name': {'S': 'test_user_name'},
+        'email': {'S': 'old@email.com'},
+        'version': {'N': 'bad'},
+    }
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = ClientError(
+            {
+                'Error': {'Code': 'ConditionalCheckFailedException'},
+                'Item': raw_item,
+            },
+            'PutItem',
+        )
+        with pytest.raises(PutError) as exc_info:
+            item.save(return_values_on_condition_failure='ALL_OLD')
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert exc_info.value.item is None
+    assert item.version == 3
 
 
 @pytest.mark.parametrize('add_version_condition', [True, False])

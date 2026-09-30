@@ -61,6 +61,8 @@ class DeleteError(PynamoDBConnectionError):
     Raised when an error occurs deleting an item
     """
     msg = "Error deleting item"
+    #: The old item decoded from the failed conditional delete, when requested and returned.
+    item: Optional[Any] = None
 
 
 class QueryError(PynamoDBConnectionError):
@@ -82,6 +84,8 @@ class PutError(PynamoDBConnectionError):
     Raised when an item fails to be created
     """
     msg = "Error putting item"
+    #: The old item decoded from the failed conditional put, when requested and returned.
+    item: Optional[Any] = None
 
 
 class UpdateError(PynamoDBConnectionError):
@@ -89,6 +93,8 @@ class UpdateError(PynamoDBConnectionError):
     Raised when an item fails to be updated
     """
     msg = "Error updating item"
+    #: The old item decoded from the failed conditional update, when requested and returned.
+    item: Optional[Any] = None
 
 
 class GetError(PynamoDBConnectionError):
@@ -132,9 +138,14 @@ class CancellationReason:
     .. _TransactGetItems: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactGetItems.html
     .. _TransactWriteItems: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html
     """
+    #: The DynamoDB error code for this action, if the action caused cancellation.
     code: str
+    #: The DynamoDB error message for this action, if returned.
     message: Optional[str] = None
+    #: The original AttributeValue map returned by DynamoDB, if available.
     raw_item: Optional[Dict[str, Dict[str, Any]]] = None
+    #: The old item decoded with the model of the corresponding transaction action.
+    item: Optional[Any] = None
 
 
 class TransactWriteError(PynamoDBException):

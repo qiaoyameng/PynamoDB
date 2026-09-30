@@ -173,16 +173,35 @@ def test_transact_write__error__transaction_cancelled__condition_check_failure(c
 def test_transact_write__error__transaction_cancelled__condition_check_failure__return_all_old(connection):
     # create a users and a bank statements for them
     User(1).save()
+    BankStatement(1, balance=50, active=False).save()
 
     # attempt to do this as a transaction with the condition that they don't already exist
     with pytest.raises(TransactWriteError) as exc_info:
         with TransactWrite(connection=connection) as transaction:
-            transaction.save(User(1), condition=(User.user_id.does_not_exist()), return_values=ALL_OLD)
+            transaction.save(
+                User(1),
+                condition=(User.user_id.does_not_exist()),
+                return_values=ALL_OLD,
+            )
+            transaction.save(
+                BankStatement(1),
+                condition=(BankStatement.user_id.does_not_exist()),
+                return_values=ALL_OLD,
+            )
     assert exc_info.value.cause_response_code == TRANSACTION_CANCELLED
     assert 'ConditionalCheckFailed' in exc_info.value.cause_response_message
-    assert exc_info.value.cancellation_reasons == [
-        CancellationReason(code='ConditionalCheckFailed', message='The conditional request failed', raw_item=User(1).to_dynamodb_dict()),
+    reasons = exc_info.value.cancellation_reasons
+    assert [reason.code for reason in reasons] == [
+        'ConditionalCheckFailed',
+        'ConditionalCheckFailed',
     ]
+    assert isinstance(reasons[0].item, User)
+    assert reasons[0].item.user_id == 1
+    assert isinstance(reasons[1].item, BankStatement)
+    assert reasons[1].item.user_id == 1
+    assert reasons[1].item.balance == 50
+    assert reasons[1].item.active is False
+    assert reasons[0].raw_item == User(1).to_dynamodb_dict()
 
 
 @pytest.mark.ddblocal

@@ -33,8 +33,16 @@ else:
     from typing_extensions import Protocol
 
 from pynamodb.expressions.update import Action
-from pynamodb.exceptions import DoesNotExist, TableDoesNotExist, TableError, InvalidStateError, PutError, \
-    AttributeNullError
+from pynamodb.exceptions import (
+    AttributeNullError,
+    DeleteError,
+    DoesNotExist,
+    InvalidStateError,
+    PutError,
+    TableDoesNotExist,
+    TableError,
+    UpdateError,
+)
 from pynamodb.attributes import (
     AttributeContainer, AttributeContainerMeta, TTLAttribute, VersionAttribute
 )
@@ -394,13 +402,21 @@ class Model(AttributeContainer, metaclass=MetaModel):
         """
         return BatchWrite(cls, auto_commit=auto_commit)
 
-    def delete(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Any:
+    def delete(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        return_values_on_condition_failure: Optional[str] = None,
+    ) -> Any:
         """
         Deletes this object from DynamoDB.
 
         :param add_version_condition: For models which have a :class:`~pynamodb.attributes.VersionAttribute`,
           specifies whether the item should only be deleted if its current version matches the expected one.
           Set to `False` for a 'delete anyway' strategy.
+        :param return_values_on_condition_failure: Set to ``ALL_OLD`` to receive the existing item when the
+          condition fails. It is decoded and attached to the raised :class:`~pynamodb.exceptions.DeleteError`.
         :raises pynamodb.exceptions.DeleteError: If the record can not be deleted
         """
         hk_value, rk_value = self._get_hash_range_key_serialized_values()
@@ -409,9 +425,25 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if add_version_condition and version_condition is not None:
             condition &= version_condition
 
-        return self._get_connection().delete_item(hk_value, range_key=rk_value, condition=condition)
+        try:
+            return self._get_connection().delete_item(
+                hk_value,
+                range_key=rk_value,
+                condition=condition,
+                return_values_on_condition_failure=return_values_on_condition_failure,
+            )
+        except DeleteError as error:
+            self._set_failed_item(error)
+            raise
 
-    def update(self, actions: List[Action], condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Any:
+    def update(
+        self,
+        actions: List[Action],
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        return_values_on_condition_failure: Optional[str] = None,
+    ) -> Any:
         """
         Updates an item using the UpdateItem operation.
 
@@ -422,6 +454,8 @@ class Model(AttributeContainer, metaclass=MetaModel):
           specifies whether only to update if the version matches the model that is currently loaded.
           Set to `False` for a 'last write wins' strategy.
           Regardless, the version will always be incremented to prevent "rollbacks" by concurrent :meth:`save` calls.
+        :param return_values_on_condition_failure: Set to ``ALL_OLD`` to receive the existing item when the
+          condition fails. It is decoded and attached to the raised :class:`~pynamodb.exceptions.UpdateError`.
         :raises pynamodb.exceptions.UpdateError: if the `condition` is not met
         """
         if not isinstance(actions, list) or len(actions) == 0:
@@ -432,7 +466,18 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if add_version_condition and version_condition is not None:
             condition &= version_condition
 
-        data = self._get_connection().update_item(hk_value, range_key=rk_value, return_values=ALL_NEW, condition=condition, actions=actions)
+        try:
+            data = self._get_connection().update_item(
+                hk_value,
+                range_key=rk_value,
+                return_values=ALL_NEW,
+                return_values_on_condition_failure=return_values_on_condition_failure,
+                condition=condition,
+                actions=actions,
+            )
+        except UpdateError as error:
+            self._set_failed_item(error)
+            raise
         item_data = data[ATTRIBUTES]
         stored_cls = self._get_discriminator_class(item_data)
         if stored_cls and stored_cls != type(self):
@@ -440,14 +485,40 @@ class Model(AttributeContainer, metaclass=MetaModel):
         self.deserialize(item_data)
         return data
 
-    def save(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Dict[str, Any]:
+    def save(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        return_values_on_condition_failure: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Save this object to dynamodb
+
+        :param return_values_on_condition_failure: Set to ``ALL_OLD`` to receive the existing item when the
+          condition fails. It is decoded and attached to the raised :class:`~pynamodb.exceptions.PutError`.
         """
-        args, kwargs = self._get_save_args(condition=condition, add_version_condition=add_version_condition)
-        data = self._get_connection().put_item(*args, **kwargs)
+        args, kwargs = self._get_save_args(
+            condition=condition,
+            add_version_condition=add_version_condition,
+            return_values_on_condition_failure=return_values_on_condition_failure,
+        )
+        try:
+            data = self._get_connection().put_item(*args, **kwargs)
+        except PutError as error:
+            self._set_failed_item(error)
+            raise
         self.update_local_version_attribute()
         return data
+
+    def _set_failed_item(self, error: Union[PutError, UpdateError, DeleteError]) -> None:
+        raw_item = getattr(getattr(error, 'cause', None), 'response', {}).get(ITEM)
+        if not raw_item:
+            return
+        try:
+            error.item = type(self).from_raw_data(raw_item)
+        except Exception:
+            log.debug("Unable to deserialize item from failed write.", exc_info=True)
 
     def refresh(self, consistent_read: bool = False) -> None:
         """
@@ -481,7 +552,14 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if add_version_condition and version_condition is not None:
             condition &= version_condition
 
-        return self._get_connection().get_operation_kwargs(hk_value, range_key=rk_value, key=KEY, actions=actions, condition=condition, return_values_on_condition_failure=return_values_on_condition_failure)
+        return self._get_connection().get_operation_kwargs(
+            hk_value,
+            range_key=rk_value,
+            key=KEY,
+            actions=actions,
+            condition=condition,
+            return_values_on_condition_failure=return_values_on_condition_failure,
+        )
 
     def get_delete_kwargs_from_instance(
         self,
@@ -496,7 +574,13 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if add_version_condition and version_condition is not None:
             condition &= version_condition
 
-        return self._get_connection().get_operation_kwargs(hk_value, range_key=rk_value, key=KEY, condition=condition, return_values_on_condition_failure=return_values_on_condition_failure)
+        return self._get_connection().get_operation_kwargs(
+            hk_value,
+            range_key=rk_value,
+            key=KEY,
+            condition=condition,
+            return_values_on_condition_failure=return_values_on_condition_failure,
+        )
 
     def get_save_kwargs_from_instance(
         self,
@@ -514,12 +598,14 @@ class Model(AttributeContainer, metaclass=MetaModel):
         hash_key: str,
         range_key: Optional[_KeyType] = None,
         condition: Optional[Condition] = None,
+        return_values_on_condition_failure: Optional[str] = None,
     ) -> Dict[str, Any]:
         hash_key, range_key = cls._serialize_keys(hash_key, range_key)
         return cls._get_connection().get_operation_kwargs(
             hash_key=hash_key,
             range_key=range_key,
-            condition=condition
+            condition=condition,
+            return_values_on_condition_failure=return_values_on_condition_failure,
         )
 
     @classmethod
@@ -894,7 +980,13 @@ class Model(AttributeContainer, metaclass=MetaModel):
 
         return schema
 
-    def _get_save_args(self, condition: Optional[Condition] = None, *, add_version_condition: bool = True) -> Tuple[Iterable[Any], Dict[str, Any]]:
+    def _get_save_args(
+        self,
+        condition: Optional[Condition] = None,
+        *,
+        add_version_condition: bool = True,
+        return_values_on_condition_failure: Optional[str] = None,
+    ) -> Tuple[Iterable[Any], Dict[str, Any]]:
         """
         Gets the proper *args, **kwargs for saving and retrieving this object
 
@@ -921,6 +1013,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
             condition &= version_condition
         kwargs['attributes'] = attribute_values
         kwargs['condition'] = condition
+        kwargs['return_values_on_condition_failure'] = return_values_on_condition_failure
         return args, kwargs
 
     def _get_hash_range_key_serialized_values(self) -> Tuple[Any, Optional[Any]]:

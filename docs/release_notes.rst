@@ -3,6 +3,17 @@
 Release Notes
 =============
 
+Unreleased
+----------
+
+Features:
+
+* Add :code:`return_values_on_condition_failure` support to :meth:`~pynamodb.models.Model.save`,
+  :meth:`~pynamodb.models.Model.update`, and :meth:`~pynamodb.models.Model.delete`; failed writes expose the
+  decoded old value as :code:`PutError.item`, :code:`UpdateError.item`, or :code:`DeleteError.item`.
+* Decode failed transaction items as :code:`CancellationReason.item` using the model for the corresponding
+  transaction action. Cancellation reasons remain in the order in which actions were added.
+
 v6.1.1
 ------
 

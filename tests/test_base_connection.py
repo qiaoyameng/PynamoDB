@@ -482,6 +482,14 @@ def test_connection_delete_item():
         conn.delete_item(TEST_TABLE_NAME, "foo", "bar", return_values='bad_values')
 
     with pytest.raises(ValueError):
+        conn.delete_item(
+            TEST_TABLE_NAME,
+            "foo",
+            "bar",
+            return_values_on_condition_failure='ALL_NEW',
+        )
+
+    with pytest.raises(ValueError):
         conn.delete_item(TEST_TABLE_NAME, "foo", "bar", return_consumed_capacity='badvalue')
 
     with pytest.raises(ValueError):
@@ -873,6 +881,39 @@ def test_connection_transact_write_items():
             'TransactItems': [],
             'ReturnConsumedCapacity': 'TOTAL'
         }
+
+    ordered_items = [
+        {'Update': {'TableName': 'update-table'}},
+        {'Put': {'TableName': 'put-table'}},
+        {'ConditionCheck': {'TableName': 'check-table'}},
+        {'Delete': {'TableName': 'delete-table'}},
+    ]
+    with patch(PATCH_METHOD) as req:
+        conn.transact_write_items([], [], [], [], transact_items=ordered_items)
+        assert req.call_args[0][1] == {
+            'TransactItems': ordered_items,
+            'ReturnConsumedCapacity': 'TOTAL',
+        }
+
+
+def test_connection_preserves_item_from_conditional_write_failure():
+    conn = Connection()
+    raw_item = {'ForumName': {'S': 'item1-hash'}}
+    conn.client._make_api_call = mock.Mock(side_effect=ClientError(
+        {
+            'Error': {
+                'Code': 'ConditionalCheckFailedException',
+                'Message': 'The conditional request failed',
+            },
+            'Item': raw_item,
+        },
+        'PutItem',
+    ))
+
+    with pytest.raises(VerboseClientError) as exc_info:
+        conn._make_api_call('PutItem', {'TableName': TEST_TABLE_NAME})
+
+    assert exc_info.value.response['Item'] == raw_item
 
 
 def test_connection_transact_get_items():
