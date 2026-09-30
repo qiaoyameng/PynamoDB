@@ -196,6 +196,23 @@ class AttributeDeserializationError(TypeError):
         super(AttributeDeserializationError, self).__init__(msg)
 
 
+class StreamAttributeDeserializationError(AttributeDeserializationError):
+    """
+    Raised when an attribute in a DynamoDB Streams record cannot be deserialized.
+    """
+    def __init__(
+        self,
+        image_name: str,
+        field_path: str,
+        image: Dict[str, Dict[str, Any]],
+    ) -> None:
+        self.image_name = image_name
+        self.field_path = field_path
+        self.image = image
+        msg = "Cannot deserialize '{}' attribute from {} image".format(field_path, image_name)
+        super(AttributeDeserializationError, self).__init__(msg)
+
+
 class AttributeNullError(ValueError):
     """
     Raised when an attribute which is not nullable (:code:`null=False`) is unset during serialization.

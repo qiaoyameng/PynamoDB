@@ -33,6 +33,7 @@ Topics
    conditional
    polymorphism
    attributes
+   streams
    transaction
    optimistic_locking
    rate_limited_operations

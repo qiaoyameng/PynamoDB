@@ -35,6 +35,7 @@ from pynamodb.constants import STRING
 from pynamodb.constants import STRING_SET
 from pynamodb.exceptions import AttributeDeserializationError
 from pynamodb.exceptions import AttributeNullError
+from pynamodb.exceptions import StreamAttributeDeserializationError
 from pynamodb.expressions.operand import Path
 
 
@@ -433,6 +434,94 @@ class AttributeContainer(metaclass=AttributeContainerMeta):
             if attribute_value and NULL not in attribute_value:
                 value = attr.deserialize(attr.get_value(attribute_value))
                 setattr(self, name, value)
+
+    def _container_deserialize_from_stream(
+        self,
+        attribute_values: Dict[str, Dict[str, Any]],
+        *,
+        image_name: str,
+        preserve_unknown_attributes: bool,
+        field_path: str = '',
+        image: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        if image is None:
+            image = attribute_values
+        self.attribute_values = {}
+
+        for name, attr in self.get_attributes().items():
+            attribute_value = attribute_values.get(attr.attr_name)
+            if attribute_value is None or NULL in attribute_value:
+                continue
+            attribute_path = '{}.{}'.format(field_path, attr.attr_name) if field_path else attr.attr_name
+            try:
+                value = _deserialize_attribute_for_stream(
+                    attr,
+                    attribute_value,
+                    image_name=image_name,
+                    image=image,
+                    field_path=attribute_path,
+                    preserve_unknown_attributes=preserve_unknown_attributes,
+                )
+            except StreamAttributeDeserializationError:
+                raise
+            except Exception as error:
+                raise StreamAttributeDeserializationError(
+                    image_name=image_name,
+                    field_path=attribute_path,
+                    image=image,
+                ) from error
+            setattr(self, name, value)
+
+        retain_unknown_attributes = preserve_unknown_attributes or isinstance(self, DynamicMapAttribute)
+        if retain_unknown_attributes:
+            known_attribute_names = {attr.attr_name for attr in self.get_attributes().values()}
+            for attr_name, attribute_value in attribute_values.items():
+                if attr_name in known_attribute_names:
+                    continue
+                attribute_path = '{}.{}'.format(field_path, attr_name) if field_path else attr_name
+                try:
+                    value = _deserialize_raw_attribute_for_stream(
+                        attribute_value,
+                        image_name=image_name,
+                        field_path=attribute_path,
+                        image=image,
+                    )
+                except StreamAttributeDeserializationError:
+                    raise
+                except Exception as error:
+                    raise StreamAttributeDeserializationError(
+                        image_name=image_name,
+                        field_path=attribute_path,
+                        image=image,
+                    ) from error
+                self.attribute_values[attr_name] = value
+
+    @classmethod
+    def _instantiate_from_stream(
+        cls: Type[_ACT],
+        attribute_values: Dict[str, Dict[str, Any]],
+        *,
+        image_name: str,
+        preserve_unknown_attributes: bool,
+        field_path: str = '',
+        image: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> _ACT:
+        stored_cls = cls._get_discriminator_class(attribute_values)
+        if stored_cls and not issubclass(stored_cls, cls):
+            raise ValueError("Cannot instantiate a {} from the returned class: {}".format(
+                cls.__name__, stored_cls.__name__))
+        target_cls = stored_cls or cls
+        instance = target_cls.__new__(target_cls)
+        instance._stream_unknown_attributes_accessible = preserve_unknown_attributes
+        AttributeContainer._container_deserialize_from_stream(
+            instance,
+            attribute_values,
+            image_name=image_name,
+            preserve_unknown_attributes=preserve_unknown_attributes,
+            field_path=field_path,
+            image=attribute_values if image is None else image,
+        )
+        return instance
 
     @classmethod
     def _update_attribute_types(cls, attribute_values: Dict[str, Dict[str, Any]]):
@@ -1086,9 +1175,15 @@ class MapAttribute(Attribute[Mapping[_KT, _VT]], AttributeContainer, metaclass=M
             raise AttributeError("'{}' has no attribute '{}'".format(self.__class__.__name__, item))
 
     def __getattr__(self, attr: str) -> _VT:
-        # This should only be called for "raw" (i.e. non-subclassed) MapAttribute instances.
-        # MapAttribute subclasses should access attributes via the Attribute descriptors.
-        if self.is_raw() and self._is_attribute_container():
+        # Attribute descriptors handle declared fields. This handles raw maps and
+        # undeclared fields retained from stream images.
+        try:
+            stream_unknown_allowed = object.__getattribute__(self, '_stream_unknown_attributes_accessible')
+        except AttributeError:
+            stream_unknown_allowed = False
+        if self._is_attribute_container() and (
+                self.is_raw()
+                or (stream_unknown_allowed and attr not in self.get_attributes())):
             try:
                 return self.attribute_values[attr]
             except KeyError:
@@ -1420,3 +1515,140 @@ SERIALIZE_CLASS_MAP: Mapping[type, Attribute] = {
     str: UnicodeAttribute(),
     bytes: BinaryAttribute(legacy_encoding=False),
 }
+
+
+def _deserialize_raw_attribute_for_stream(
+    attribute_value: Dict[str, Any],
+    *,
+    image_name: str,
+    field_path: str,
+    image: Dict[str, Dict[str, Any]],
+) -> Any:
+    try:
+        attr_type, raw_value = next(iter(attribute_value.items()))
+        raw_value = _decode_stream_binary_value(attr_type, raw_value)
+        if attr_type == MAP:
+            return {
+                key: _deserialize_raw_attribute_for_stream(
+                    value,
+                    image_name=image_name,
+                    field_path='{}.{}'.format(field_path, key),
+                    image=image,
+                )
+                for key, value in raw_value.items()
+            }
+        if attr_type == LIST:
+            return [
+                _deserialize_raw_attribute_for_stream(
+                    value,
+                    image_name=image_name,
+                    field_path='{}[{}]'.format(field_path, index),
+                    image=image,
+                )
+                for index, value in enumerate(raw_value)
+            ]
+        return DESERIALIZE_CLASS_MAP[attr_type].deserialize(raw_value)
+    except Exception as error:
+        raise StreamAttributeDeserializationError(
+            image_name=image_name,
+            field_path=field_path,
+            image=image,
+        ) from error
+
+
+def _deserialize_attribute_for_stream(
+    attr: Attribute[Any],
+    attribute_value: Dict[str, Any],
+    *,
+    image_name: str,
+    field_path: str,
+    image: Dict[str, Dict[str, Any]],
+    preserve_unknown_attributes: bool,
+) -> Any:
+    try:
+        raw_value = attr.get_value(attribute_value)
+    except Exception as error:
+        raise StreamAttributeDeserializationError(
+            image_name=image_name,
+            field_path=field_path,
+            image=image,
+        ) from error
+    raw_value = _decode_stream_binary_value(
+        attr.attr_type,
+        raw_value,
+        getattr(attr, 'legacy_encoding', False),
+    )
+
+    if isinstance(attr, DynamicMapAttribute) or (isinstance(attr, MapAttribute) and not attr.is_raw()):
+        return type(attr)._instantiate_from_stream(
+            raw_value,
+            image_name=image_name,
+            preserve_unknown_attributes=preserve_unknown_attributes,
+            field_path=field_path,
+            image=image,
+        )
+
+    if isinstance(attr, MapAttribute) and attr.is_raw():
+        return _deserialize_raw_attribute_for_stream(
+            {MAP: raw_value},
+            image_name=image_name,
+            field_path=field_path,
+            image=image,
+        )
+
+    if isinstance(attr, ListAttribute) and attr.element_type is None:
+        return _deserialize_raw_attribute_for_stream(
+            {LIST: raw_value},
+            image_name=image_name,
+            field_path=field_path,
+            image=image,
+        )
+
+    if isinstance(attr, ListAttribute) and attr.element_type is not None:
+        values = []
+        if issubclass(attr.element_type, (BinaryAttribute, BinarySetAttribute)):
+            element_attr = attr.element_type(legacy_encoding=False)
+        else:
+            element_attr = attr.element_type()
+            if isinstance(element_attr, MapAttribute):
+                element_attr._make_attribute()
+        for index, element_value in enumerate(raw_value):
+            if NULL in element_value:
+                values.append(None)
+                continue
+
+            element_path = '{}[{}]'.format(field_path, index)
+            value = _deserialize_attribute_for_stream(
+                element_attr,
+                element_value,
+                image_name=image_name,
+                field_path=element_path,
+                image=image,
+                preserve_unknown_attributes=preserve_unknown_attributes,
+            )
+            values.append(value)
+        return values
+
+    try:
+        return attr.deserialize(raw_value)
+    except StreamAttributeDeserializationError:
+        raise
+    except Exception as error:
+        raise StreamAttributeDeserializationError(
+            image_name=image_name,
+            field_path=field_path,
+            image=image,
+        ) from error
+
+
+def _decode_stream_binary_value(attr_type: str, raw_value: Any, legacy_encoding: bool = False) -> Any:
+    if not legacy_encoding and attr_type == BINARY and isinstance(raw_value, str):
+        return b64decode(raw_value)
+    if (
+            not legacy_encoding
+            and attr_type == BINARY_SET
+            and raw_value
+            and all(isinstance(value, str) for value in raw_value)
+    ):
+        return [b64decode(value) for value in raw_value]
+    return raw_value

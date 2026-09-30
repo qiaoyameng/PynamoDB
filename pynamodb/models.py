@@ -23,6 +23,7 @@ from typing import Type
 from typing import TypeVar
 from typing import Union
 from typing import cast
+from typing import TYPE_CHECKING
 
 from pynamodb._schema import ModelSchema
 from pynamodb.connection.base import MetaTable
@@ -31,6 +32,9 @@ if sys.version_info >= (3, 8):
     from typing import Protocol
 else:
     from typing_extensions import Protocol
+
+if TYPE_CHECKING:
+    from pynamodb.streams import StreamRecord
 
 from pynamodb.expressions.update import Action
 from pynamodb.exceptions import DoesNotExist, TableDoesNotExist, TableError, InvalidStateError, PutError, \
@@ -290,6 +294,7 @@ class Model(AttributeContainer, metaclass=MetaModel):
     _connection: Optional[TableConnection] = None
     DoesNotExist: Type[DoesNotExist] = DoesNotExist
     _version_attribute_name: Optional[str] = None
+    _stream_unknown_attributes_accessible: bool = False
 
     Meta: MetaProtocol
     _indexes: Dict[str, Index]
@@ -315,6 +320,19 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 raise ValueError(f"This model has no range key, but a range key value was provided: {range_key}")
             attributes[self._range_keyname] = range_key
         super(Model, self).__init__(_user_instantiated=_user_instantiated, **attributes)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            attribute_values = object.__getattribute__(self, 'attribute_values')
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        stream_unknown_allowed = object.__getattribute__(
+            self,
+            '_stream_unknown_attributes_accessible',
+        )
+        if stream_unknown_allowed and name in attribute_values:
+            return attribute_values[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     @classmethod
     def batch_get(
@@ -565,6 +583,31 @@ class Model(AttributeContainer, metaclass=MetaModel):
             raise ValueError("Received no data to construct object")
 
         return cls._instantiate(data)
+
+    @classmethod
+    def from_stream_record(
+        cls: Type[_T],
+        record: Dict[str, Any],
+        *,
+        preserve_unknown_attributes: bool = False,
+    ) -> 'StreamRecord[_T]':
+        """
+        Decodes a DynamoDB Streams record into model instances.
+
+        The ``key`` image is always decoded. ``old_image`` and ``new_image``
+        are decoded when present and remain ``None`` when the stream record
+        does not include them. No default values are added to partial images.
+
+        :param record: A record from a DynamoDB Streams event.
+        :param preserve_unknown_attributes: If true, attributes not declared on
+            the model are retained as decoded Python values.
+        """
+        from pynamodb.streams import decode_stream_record
+        return decode_stream_record(
+            cls,
+            record,
+            preserve_unknown_attributes=preserve_unknown_attributes,
+        )
 
     @classmethod
     def count(

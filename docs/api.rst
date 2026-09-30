@@ -19,6 +19,9 @@ High Level API
 .. automodule:: pynamodb.pagination
     :members:
 
+.. automodule:: pynamodb.streams
+    :members:
+
 Low Level API
 -------------
 
@@ -43,5 +46,6 @@ Exceptions
 .. autoexception:: pynamodb.exceptions.TransactGetError
 .. autoexception:: pynamodb.exceptions.InvalidStateError
 .. autoexception:: pynamodb.exceptions.AttributeDeserializationError
+.. autoexception:: pynamodb.exceptions.StreamAttributeDeserializationError
 .. autoexception:: pynamodb.exceptions.AttributeNullError
 .. autoclass:: pynamodb.exceptions.CancellationReason
