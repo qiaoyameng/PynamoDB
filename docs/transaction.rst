@@ -34,6 +34,68 @@ A :py:class:`TransactWrite <pynamodb.transactions.TransactWrite>` can be initial
 * ``client_request_token`` - an idempotency key for the request (see `ClientRequestToken <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html#DDB-TransactWriteItems-request-ClientRequestToken>`_ in the DynamoDB API reference)
 * ``return_consumed_capacity`` - determines the level of detail about provisioned throughput consumption that is returned in the response (see `ReturnConsumedCapacity <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html#DDB-TransactWriteItems-request-ReturnConsumedCapacity>`_ in the DynamoDB API reference)
 * ``return_item_collection_metrics`` - determines whether item collection metrics are returned (see `ReturnItemCollectionMetrics <https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html#DDB-TransactWriteItems-request-ReturnItemCollectionMetrics>`_ in the DynamoDB API reference)
+* ``merge`` - optional, defaults to ``False``. When ``True``, a merge (coalescing) phase runs before the request is sent; see :ref:`transaction_merging`.
+
+.. _transaction_merging:
+
+Merging Actions on the Same Item
+""""""""""""""""""""""""""""""""
+
+DynamoDB rejects a transaction that targets the same item more than once. When
+several modules each add their own actions to a shared
+:py:class:`TransactWrite <pynamodb.transactions.TransactWrite>`, more than one
+of them may touch the same item. Passing ``merge=True`` enables an optional
+merge phase that combines such actions into a single transaction entry *before*
+the request is sent:
+
+* Non-conflicting ``update`` actions on the same item are combined into one
+  ``Update`` expression, and their conditions are all retained (combined with
+  ``AND``).
+* ``condition_check`` actions on an item that is also written are folded into
+  the condition of that write; multiple ``condition_check`` actions on the same
+  item are likewise combined.
+* Identical ``delete`` actions are combined (conditions combined with ``AND``),
+  and identical ``save`` (``Put``) actions are de-duplicated.
+
+Attribute aliases (``attr_name``) and composite (hash + range) keys are
+normalized before merging, so two actions are only combined when they truly
+target the same physical item and document paths.
+
+Some combinations cannot be expressed as a single equivalent operation and
+cause a :py:exc:`TransactWriteMergeError <pynamodb.exceptions.TransactWriteMergeError>`
+to be raised (without sending any request):
+
+* a ``delete`` or ``save`` together with an ``update`` (or any two different
+  write kinds) on the same item;
+* two ``update`` actions writing the same attribute or parent/child document
+  paths (e.g. writing both ``address`` and ``address.city``);
+* two non-equivalent ``save`` actions;
+* actions whose optimistic-locking version conditions disagree (two in-memory
+  copies of the item loaded at different versions);
+* actions with different ``ReturnValuesOnConditionCheckFailure`` settings.
+
+The error lists each original action together with the source location (file
+and line) of the ``condition_check``/``delete``/``save``/``update`` call that
+added it.
+
+.. code-block:: python
+
+    with TransactWrite(connection=connection, merge=True) as transaction:
+        # these two updates touch different attributes of the same item and
+        # are sent as a single UpdateItem with both conditions AND-ed
+        transaction.update(
+            BankStatement('user1'),
+            actions=[BankStatement.account_balance.add(-100)],
+            condition=(BankStatement.account_balance >= 100),
+        )
+        transaction.update(
+            BankStatement('user1'),
+            actions=[BankStatement.is_active.set(True)],
+        )
+
+As without merging, optimistic-locking :class:`~pynamodb.attributes.VersionAttribute`
+conditions are validated and the in-memory version attribute is only updated
+after the transaction is committed successfully.
 
 Here's an example of using a context manager for a :py:class:`TransactWrite <pynamodb.transactions.TransactWrite>` operation:
 

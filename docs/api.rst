@@ -40,6 +40,7 @@ Exceptions
 .. autoexception:: pynamodb.exceptions.TableDoesNotExist
 .. autoexception:: pynamodb.exceptions.DoesNotExist
 .. autoexception:: pynamodb.exceptions.TransactWriteError
+.. autoexception:: pynamodb.exceptions.TransactWriteMergeError
 .. autoexception:: pynamodb.exceptions.TransactGetError
 .. autoexception:: pynamodb.exceptions.InvalidStateError
 .. autoexception:: pynamodb.exceptions.AttributeDeserializationError

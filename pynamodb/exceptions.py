@@ -122,6 +122,47 @@ class TableDoesNotExist(PynamoDBException):
 
 
 @dataclass
+class MergedActionLocation:
+    """
+    Describes one of the actions involved in a failed
+    :class:`~pynamodb.transactions.TransactWrite` merge, along with the
+    source location of the call that originally added it to the transaction.
+    """
+    operation: str
+    filename: Optional[str] = None
+    lineno: Optional[int] = None
+    function: Optional[str] = None
+    item: Optional[str] = None
+
+    def __str__(self) -> str:
+        location = ""
+        if self.filename is not None:
+            location = " at {}:{}".format(self.filename, self.lineno)
+            if self.function:
+                location += " in {}".format(self.function)
+        item = " on item {}".format(self.item) if self.item else ""
+        return "{}{}{}".format(self.operation, item, location)
+
+
+class TransactWriteMergeError(PynamoDBException):
+    """
+    Raised when the optional merge phase of a
+    :class:`~pynamodb.transactions.TransactWrite` cannot combine actions
+    targeting the same DynamoDB item (e.g. a delete together with an update,
+    overlapping update paths, or conflicting optimistic-locking versions).
+
+    The conflicting actions are listed on :attr:`actions`, each annotated with
+    the source location of the original ``condition_check``/``delete``/``save``/
+    ``update`` call.
+    """
+
+    def __init__(self, msg: str, actions: Iterable['MergedActionLocation']) -> None:
+        self.actions: List['MergedActionLocation'] = list(actions)
+        details = "\n".join("  - {}".format(action) for action in self.actions)
+        super().__init__("{}\n{}".format(msg, details) if details else msg)
+
+
+@dataclass
 class CancellationReason:
     """
     A reason for a transaction cancellation.
