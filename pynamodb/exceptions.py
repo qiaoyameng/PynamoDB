@@ -180,6 +180,18 @@ class TransactGetError(PynamoDBException):
         return self.cause.cancellation_reasons
 
 
+class TransactWriteMergeError(PynamoDBException):
+    """
+    Raised when actions queued on a :class:`~pynamodb.transactions.TransactWrite`
+    with action merging enabled cannot be merged into a single valid
+    ``TransactWriteItems`` request (for example, an update and a delete of the
+    same item, or overlapping document paths in the merged update expression).
+
+    The message lists the positions of the original actions that conflict.
+    """
+    msg = "Cannot merge transaction write actions"
+
+
 class InvalidStateError(PynamoDBException):
     """
     Raises when the internal state of an operation context is invalid.

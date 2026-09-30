@@ -217,6 +217,49 @@ The ``.get`` returns a class of type ``_ModelFuture`` that acts as a placeholder
 To retrieve the resolved model, you say `model_future.get()`. Any attempt to access this model before the transaction is complete
 will result in a :py:class:`InvalidStateError <pynamodb.exceptions.InvalidStateError>`.
 
+Merging Actions on the Same Item
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+DynamoDB transactions may contain at most one action per item, and they are rejected if the same item is
+written more than once. When several independent parts of an application (for example, separate modules)
+enqueue actions onto the same :py:class:`TransactWrite <pynamodb.transactions.TransactWrite>`, they can
+easily target the same item by accident.
+
+Pass ``merge_actions=True`` to enable an optional merge phase that runs at commit time:
+
+.. code-block:: python
+
+    with TransactWrite(connection=connection, merge_actions=True) as transaction:
+        transaction.update(
+            BankStatement('user1'),
+            actions=[BankStatement.is_active.set(False)],
+        )
+        transaction.update(
+            BankStatement('user1'),
+            actions=[BankStatement.account_balance.add(-10)],
+            condition=BankStatement.account_balance >= 10,
+        )
+
+The two updates are combined into a single ``Update`` action. Non-conflicting attribute updates are kept
+(SET/REMOVE/ADD/DELETE clauses are merged), and their conditions are combined with AND. Item keys and
+attribute names are normalized before grouping, so alias attribute names (``attr_name``) and equivalent
+numeric key forms (``1`` and ``1.0``) do not cause two different items to be merged (or one item to be
+treated as two).
+
+Some actions cannot be merged and raise
+:py:class:`TransactWriteMergeError <pynamodb.exceptions.TransactWriteMergeError>` *before* any request is
+sent to DynamoDB:
+
+* a delete and an update (or put) of the same item;
+* updates whose document paths overlap, including parent/child paths (e.g. ``foo`` and ``foo[0]``);
+* duplicate actions that are not idempotent, such as two numeric ``ADD`` increments on the same attribute;
+* puts that write different values for the same item, or a put combined with another write;
+* optimistic-locking (version) conditions that expect different versions.
+
+The error message lists the position (file and line number) of each original action that conflicts.
+Optimistic-locking version conditions remain enforced on the combined action, and the local ``version``
+attribute of the enqueued models is incremented only after the transaction is committed successfully.
+
 Error Types
 ^^^^^^^^^^^
 
@@ -225,6 +268,7 @@ You can expect some new error types with transactions, such as:
 * :py:exc:`TransactWriteError <pynamodb.exceptions.TransactWriteError>` - thrown when a :py:class:`TransactWrite <pynamodb.transactions.TransactWrite>` request returns a bad response (see the `TransactWriteItems Errors`_ section in the DynamoDB API reference).
 * :py:exc:`TransactGetError <pynamodb.exceptions.TransactGetError>` - thrown when a :py:class:`TransactGet <pynamodb.transactions.TransactGet>` request returns a bad response (see the `TransactGetItems Errors`_ section in the DynamoDB API reference).
 * :py:exc:`InvalidStateError <pynamodb.exceptions.InvalidStateError>` - thrown when an attempt is made to access data on a :py:class:`_ModelFuture <pynamodb.models._ModelFuture>` before the `TransactGet` request is completed.
+* :py:exc:`TransactWriteMergeError <pynamodb.exceptions.TransactWriteMergeError>` - thrown when actions enqueued on a :py:class:`TransactWrite <pynamodb.transactions.TransactWrite>` with ``merge_actions=True`` cannot be merged into a valid transaction.
 
 .. _Update ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Update.html#DDB-Type-Update-ReturnValuesOnConditionCheckFailure>
 .. _Put ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Put.html#DDB-Type-Put-ReturnValuesOnConditionCheckFailure
