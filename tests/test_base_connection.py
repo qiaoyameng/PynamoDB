@@ -1371,6 +1371,23 @@ def test_connection__make_api_call__wraps_verbose_client_error_create(send_mock)
         in str(excinfo.value)
     )
 
+
+def test_connection__make_api_call__keeps_conditional_failure_item():
+    raw_item = {'id': {'S': 'item-id'}}
+    c = Connection(max_retry_attempts=0)
+    c._client = mock.Mock()
+    c._client._make_api_call.side_effect = ClientError(
+        {'Error': {'Code': 'ConditionalCheckFailedException'}, 'Item': raw_item},
+        'PutItem',
+    )
+
+    with pytest.raises(VerboseClientError) as excinfo:
+        c._make_api_call('PutItem', {'TableName': 'MyTable'})
+
+    assert excinfo.value.response['Error']['Code'] == 'ConditionalCheckFailedException'
+    assert excinfo.value.response['Item'] == raw_item
+
+
 @mock.patch('botocore.httpsession.URLLib3Session.send')
 def test_connection__make_api_call__wraps_verbose_client_error_batch(send_mock):
     response = AWSResponse(

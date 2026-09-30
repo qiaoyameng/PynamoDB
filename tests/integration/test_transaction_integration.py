@@ -180,9 +180,12 @@ def test_transact_write__error__transaction_cancelled__condition_check_failure__
             transaction.save(User(1), condition=(User.user_id.does_not_exist()), return_values=ALL_OLD)
     assert exc_info.value.cause_response_code == TRANSACTION_CANCELLED
     assert 'ConditionalCheckFailed' in exc_info.value.cause_response_message
-    assert exc_info.value.cancellation_reasons == [
-        CancellationReason(code='ConditionalCheckFailed', message='The conditional request failed', raw_item=User(1).to_dynamodb_dict()),
-    ]
+    reason = exc_info.value.cancellation_reasons[0]
+    assert reason.code == 'ConditionalCheckFailed'
+    assert reason.message == 'The conditional request failed'
+    assert reason.raw_item == User(1).to_dynamodb_dict()
+    assert isinstance(reason.item, User)
+    assert reason.item.user_id == 1
 
 
 @pytest.mark.ddblocal

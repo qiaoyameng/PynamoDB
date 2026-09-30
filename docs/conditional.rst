@@ -160,3 +160,26 @@ You can check for conditional operation failures by inspecting the cause of the 
     except PutError as e:
         if e.cause_response_code = "ConditionalCheckFailedException":
             raise ThreadDidNotExistError()
+
+Pass :code:`return_values_on_condition_failure=ALL_OLD` to :meth:`~pynamodb.models.Model.save`,
+:meth:`~pynamodb.models.Model.update`, or :meth:`~pynamodb.models.Model.delete` to have DynamoDB
+return the item as it existed before the failed write. PynamoDB decodes that item with the model
+of the write and exposes it as :code:`e.item`. The original error code and message remain available,
+and a failed write does not advance a local :class:`~pynamodb.attributes.VersionAttribute`.
+
+.. code-block:: python
+
+    from pynamodb.constants import ALL_OLD
+    from pynamodb.exceptions import PutError
+
+    try:
+        thread_item.save(
+            Thread.forum_name.exists(),
+            return_values_on_condition_failure=ALL_OLD,
+        )
+    except PutError as e:
+        if e.cause_response_code == "ConditionalCheckFailedException":
+            old_thread_item = e.item
+
+If DynamoDB does not return an item, or the returned item cannot be decoded, :code:`e.item` is
+:code:`None` and the original conditional-write exception is still raised.

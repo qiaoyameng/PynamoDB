@@ -14,9 +14,11 @@ from botocore.client import ClientError
 import pytest
 
 from .deep_eq import deep_eq
-from pynamodb.exceptions import DoesNotExist, TableError, PutError, AttributeDeserializationError
+from pynamodb.exceptions import (
+    DoesNotExist, TableError, PutError, UpdateError, DeleteError, AttributeDeserializationError
+)
 from pynamodb.constants import (
-    ITEM, STRING, ALL, KEYS_ONLY, INCLUDE, REQUEST_ITEMS, UNPROCESSED_KEYS, CAMEL_COUNT,
+    ITEM, STRING, ALL, ALL_OLD, KEYS_ONLY, INCLUDE, REQUEST_ITEMS, UNPROCESSED_KEYS, CAMEL_COUNT,
     RESPONSES, KEYS, ITEMS, LAST_EVALUATED_KEY, EXCLUSIVE_START_KEY, ATTRIBUTES, BINARY,
     UNPROCESSED_ITEMS, DEFAULT_ENCODING, MAP, LIST, NUMBER, SCANNED_COUNT,
 )
@@ -3456,3 +3458,113 @@ def test_delete_with_wait(mocker):
     assert result == mock__get_connection.return_value.delete_table.return_value
     # Should have called exists 3 times.
     assert mock_exists.call_count == 3
+
+
+def test_conditional_write_returns_old_item_on_failure():
+    raw_item = {
+        'name': {'S': 'old-name'},
+        'email': {'S': 'old@example.com'},
+        'version': {'N': '3'},
+    }
+    client_error = ClientError(
+        {'Error': {'Code': 'ConditionalCheckFailedException'}, ITEM: raw_item},
+        'PutItem',
+    )
+
+    item = VersionedModel('new-name', email='new@example.com', version=3)
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = client_error
+        with pytest.raises(PutError) as exc_info:
+            item.save(return_values_on_condition_failure=ALL_OLD)
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert req.call_args[0][1]['ReturnValuesOnConditionCheckFailure'] == 'ALL_OLD'
+    assert isinstance(exc_info.value.item, VersionedModel)
+    assert exc_info.value.item is not item
+    assert exc_info.value.item.name == 'old-name'
+    assert exc_info.value.item.email == 'old@example.com'
+    assert exc_info.value.item.version == 3
+    assert item.version == 3
+
+
+def test_conditional_update_returns_old_item_without_advancing_version():
+    raw_item = {
+        'name': {'S': 'old-name'},
+        'email': {'S': 'old@example.com'},
+        'version': {'N': '3'},
+    }
+    client_error = ClientError(
+        {'Error': {'Code': 'ConditionalCheckFailedException'}, ITEM: raw_item},
+        'UpdateItem',
+    )
+
+    item = VersionedModel('new-name', email='new@example.com', version=3)
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = client_error
+        with pytest.raises(UpdateError) as exc_info:
+            item.update(
+                [VersionedModel.email.set('updated@example.com')],
+                return_values_on_condition_failure=ALL_OLD,
+            )
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert req.call_args[0][1]['ReturnValuesOnConditionCheckFailure'] == 'ALL_OLD'
+    assert exc_info.value.item.name == 'old-name'
+    assert exc_info.value.item.version == 3
+    assert item.version == 3
+
+
+def test_conditional_delete_returns_old_item_without_advancing_version():
+    raw_item = {
+        'name': {'S': 'old-name'},
+        'email': {'S': 'old@example.com'},
+        'version': {'N': '3'},
+    }
+    client_error = ClientError(
+        {'Error': {'Code': 'ConditionalCheckFailedException'}, ITEM: raw_item},
+        'DeleteItem',
+    )
+
+    item = VersionedModel('old-name', email='old@example.com', version=3)
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = client_error
+        with pytest.raises(DeleteError) as exc_info:
+            item.delete(return_values_on_condition_failure=ALL_OLD)
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert req.call_args[0][1]['ReturnValuesOnConditionCheckFailure'] == 'ALL_OLD'
+    assert exc_info.value.item.name == 'old-name'
+    assert exc_info.value.item.version == 3
+    assert item.version == 3
+
+
+def test_conditional_write_without_item_does_not_construct_model():
+    client_error = ClientError({'Error': {'Code': 'ConditionalCheckFailedException'}}, 'PutItem')
+
+    item = VersionedModel('name', email='name@example.com')
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = client_error
+        with pytest.raises(PutError) as exc_info:
+            item.save(return_values_on_condition_failure=ALL_OLD)
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert exc_info.value.item is None
+    assert item.version is None
+
+
+def test_conditional_write_invalid_item_keeps_condition_failure():
+    raw_item = {'name': {'S': 'name'}, 'version': {'S': 'not-a-number'}}
+    client_error = ClientError(
+        {'Error': {'Code': 'ConditionalCheckFailedException'}, ITEM: raw_item},
+        'PutItem',
+    )
+
+    item = VersionedModel('name', email='name@example.com')
+    with patch(PATCH_METHOD) as req:
+        req.side_effect = client_error
+        with pytest.raises(PutError) as exc_info:
+            item.save(return_values_on_condition_failure=ALL_OLD)
+
+    assert exc_info.value.cause_response_code == 'ConditionalCheckFailedException'
+    assert exc_info.value.item is None
+    assert exc_info.value.cause.response[ITEM] == raw_item

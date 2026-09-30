@@ -8,12 +8,17 @@ from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import TYPE_CHECKING
+
 if sys.version_info >= (3, 8):
     from typing import Literal
 else:
     from typing_extensions import Literal
 
 import botocore.exceptions
+
+if TYPE_CHECKING:
+    from pynamodb.models import Model
 
 
 class PynamoDBException(Exception):
@@ -61,6 +66,7 @@ class DeleteError(PynamoDBConnectionError):
     Raised when an error occurs deleting an item
     """
     msg = "Error deleting item"
+    item: Optional['Model'] = None
 
 
 class QueryError(PynamoDBConnectionError):
@@ -82,6 +88,7 @@ class PutError(PynamoDBConnectionError):
     Raised when an item fails to be created
     """
     msg = "Error putting item"
+    item: Optional['Model'] = None
 
 
 class UpdateError(PynamoDBConnectionError):
@@ -89,6 +96,7 @@ class UpdateError(PynamoDBConnectionError):
     Raised when an item fails to be updated
     """
     msg = "Error updating item"
+    item: Optional['Model'] = None
 
 
 class GetError(PynamoDBConnectionError):
@@ -125,6 +133,9 @@ class TableDoesNotExist(PynamoDBException):
 class CancellationReason:
     """
     A reason for a transaction cancellation.
+
+    ``item`` is decoded from ``raw_item`` using the model class for the transaction operation at the
+    same index. It remains ``None`` when DynamoDB does not return an item or decoding fails.
     
     For a list of possible cancellation reasons and their semantics,
     see `TransactGetItems`_ and `TransactWriteItems`_ in the AWS documentation.
@@ -135,6 +146,7 @@ class CancellationReason:
     code: str
     message: Optional[str] = None
     raw_item: Optional[Dict[str, Dict[str, Any]]] = None
+    item: Optional['Model'] = None
 
 
 class TransactWriteError(PynamoDBException):

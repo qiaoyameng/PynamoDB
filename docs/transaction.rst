@@ -108,7 +108,9 @@ Now, say you make another attempt to debit one of the accounts when they don't h
         assert e.cause_response_code == 'TransactionCanceledException'
         # the first 'update' was a reason for the cancellation
         assert e.cancellation_reasons[0].code == 'ConditionalCheckFailed'
-        # when return_values=ALL_OLD, the old values can be accessed from the raw_item property
+        # when return_values=ALL_OLD, the old values are decoded with the operation's model
+        assert e.cancellation_reasons[0].item.account_balance == user1_statement.account_balance
+        # the raw DynamoDB item remains available as well
         assert BankStatement.from_dynamodb_dict(e.cancellation_reasons[0].raw_item) == user1_statement
         # the second 'update' wasn't a reason, but was cancelled too
         assert e.cancellation_reasons[1] is None
@@ -131,6 +133,7 @@ transaction to fail. The ``condition`` argument is of type :ref:`conditional_ope
 * ``hash_key``  (required)
 * ``range_key`` (optional)
 * ``condition`` (required) - of type :py:class:`Condition <pynamodb.expressions.condition.Condition>` (see :ref:`conditional_operations`)
+* ``return_values`` (optional) - the values that should be returned if the condition fails (see `ConditionCheck ReturnValuesOnConditionCheckFailure`_)
 
 .. code-block:: python
 
@@ -145,6 +148,13 @@ The ``Delete`` operation functions similarly to ``Model.delete``.
 
 * ``model`` (required)
 * ``condition`` (optional) - of type :py:class:`Condition <pynamodb.expressions.condition.Condition>` (see :ref:`conditional_operations`)
+* ``return_values`` (optional) - the values that should be returned if the condition fails (see `Delete ReturnValuesOnConditionCheckFailure`_)
+
+When a transaction is cancelled, each value in :code:`cancellation_reasons` corresponds to the
+operation at the same index in the transaction. For operations called with
+:code:`return_values=ALL_OLD`, :code:`item` is the returned old item decoded using that operation's
+model, while :code:`raw_item` contains the original DynamoDB mapping. If no item is returned or it
+cannot be decoded, :code:`item` is :code:`None` and the original cancellation error is preserved.
 
 .. code-block:: python
 
@@ -162,7 +172,7 @@ The ``Put`` operation functions similarly to ``Model.save``.
 
 * ``model`` (required)
 * ``condition`` (optional) - of type :py:class:`Condition <pynamodb.expressions.condition.Condition>` (see :ref:`conditional_operations`)
-* ``return_values`` (optional) - the values that should be returned if the condition fails ((see `Put ReturnValuesOnConditionCheckFailure`_ in the DynamoDB API reference)
+* ``return_values`` (optional) - the values that should be returned if the condition fails (see `Put ReturnValuesOnConditionCheckFailure`_ in the DynamoDB API reference)
 
 .. code-block:: python
 
@@ -228,5 +238,7 @@ You can expect some new error types with transactions, such as:
 
 .. _Update ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Update.html#DDB-Type-Update-ReturnValuesOnConditionCheckFailure>
 .. _Put ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Put.html#DDB-Type-Put-ReturnValuesOnConditionCheckFailure
+.. _Delete ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Delete.html#DDB-Type-Delete-ReturnValuesOnConditionCheckFailure
+.. _ConditionCheck ReturnValuesOnConditionCheckFailure: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ConditionCheck.html#DDB-Type-ConditionCheck-ReturnValuesOnConditionCheckFailure
 .. _TransactWriteItems Errors: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html#API_TransactWriteItems_Errors
 .. _TransactGetItems Errors: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactGetItems.html#API_TransactGetItems_Errors
