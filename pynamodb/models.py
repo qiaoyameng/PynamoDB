@@ -17,6 +17,7 @@ from typing import List
 from typing import Mapping
 from typing import Optional
 from typing import Sequence
+from typing import Set
 from typing import Text
 from typing import Tuple
 from typing import Type
@@ -64,6 +65,48 @@ _KeyType = Any
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
+
+
+class BatchGetPlaceholder:
+    """
+    A marker used in the result of :meth:`Model.batch_get_ordered` for positions
+    that do not correspond to a model instance.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return type(self).__name__
+
+    def __bool__(self) -> bool:
+        return False
+
+
+class BatchGetNotFound(BatchGetPlaceholder):
+    """
+    Marks a position whose key was processed by DynamoDB but does not exist in the table.
+    """
+
+
+class BatchGetUnknown(BatchGetPlaceholder):
+    """
+    Marks a position whose key was still unprocessed after all retry attempts were exhausted.
+    """
+
+
+#: Singleton marker returned by :meth:`Model.batch_get_ordered` for keys that do not exist.
+BATCH_GET_NOT_FOUND = BatchGetNotFound()
+
+#: Singleton marker returned by :meth:`Model.batch_get_ordered` for keys whose
+#: processing status is unknown because UnprocessedKeys retries were exhausted.
+BATCH_GET_UNKNOWN = BatchGetUnknown()
+
+
+def _unwrap_attribute_value(value: Any) -> Any:
+    # Keys built from attribute serialization hold plain serialized values, while
+    # response items and UnprocessedKeys use the DynamoDB wire format ({'S': 'value'}).
+    if isinstance(value, dict) and len(value) == 1:
+        return next(iter(value.values()))
+    return value
 
 
 class BatchWrite(Generic[_T]):
@@ -348,25 +391,11 @@ class Model(AttributeContainer, metaclass=MetaModel):
                     else:
                         keys_to_get = []
             item = items.pop()
+            hash_key_ser, range_key_ser = cls._serialize_batch_get_key(item)
+            key = {hash_key_attribute.attr_name: hash_key_ser}
             if range_key_attribute:
-                if isinstance(item, str):
-                    raise ValueError(f'Invalid key value {item!r}: '
-                                     'expected non-str iterable with exactly 2 elements (hash key, range key)')
-                try:
-                    hash_key, range_key = item
-                except (TypeError, ValueError):
-                    raise ValueError(f'Invalid key value {item!r}: '
-                                     'expected iterable with exactly 2 elements (hash key, range key)')
-                hash_key_ser, range_key_ser = cls._serialize_keys(hash_key, range_key)
-                keys_to_get.append({
-                    hash_key_attribute.attr_name: hash_key_ser,
-                    range_key_attribute.attr_name: range_key_ser,
-                })
-            else:
-                hash_key_ser, _ = cls._serialize_keys(item)
-                keys_to_get.append({
-                    hash_key_attribute.attr_name: hash_key_ser
-                })
+                key[range_key_attribute.attr_name] = range_key_ser
+            keys_to_get.append(key)
 
         while keys_to_get:
             page, unprocessed_keys = cls._batch_get_page(
@@ -380,6 +409,95 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 keys_to_get = unprocessed_keys
             else:
                 keys_to_get = []
+
+    @classmethod
+    def batch_get_ordered(
+        cls: Type[_T],
+        items: Iterable[Union[_KeyType, Iterable[_KeyType]]],
+        consistent_read: Optional[bool] = None,
+        attributes_to_get: Optional[Sequence[str]] = None,
+        max_retries: int = 3,
+    ) -> List[Union[_T, BatchGetPlaceholder]]:
+        """
+        BatchGetItem for this model, preserving the order and duplicates of the requested keys.
+
+        Unlike :meth:`batch_get`, duplicate keys are de-duplicated before calling DynamoDB,
+        and the result is a list with exactly one entry per requested key, in request order:
+
+        * a model instance if the item was returned (a distinct instance per position),
+        * :data:`BATCH_GET_NOT_FOUND` if the key was processed but no item exists,
+        * :data:`BATCH_GET_UNKNOWN` if the key was still unprocessed after ``max_retries`` retries.
+
+        :param items: Should be a list of hash keys to retrieve, or a list of
+            tuples if range keys are used. Duplicate keys are allowed and are
+            only requested once.
+        :param consistent_read: Whether or not this needs to be consistent
+        :param attributes_to_get: A list of attributes to return
+        :param max_retries: How many times to retry keys returned in UnprocessedKeys
+        """
+        hash_key_attribute = cls._hash_key_attribute()
+        range_key_attribute = cls._range_key_attribute()
+
+        position_keys: List[Tuple[Any, Any]] = []
+        unique_keys: List[Tuple[Any, Any]] = []
+        seen_keys: Set[Tuple[Any, Any]] = set()
+        for item in items:
+            key = cls._serialize_batch_get_key(item)
+            position_keys.append(key)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique_keys.append(key)
+
+        def request_key(key: Tuple[Any, Any]) -> Dict[str, Any]:
+            hash_key_ser, range_key_ser = key
+            request = {hash_key_attribute.attr_name: hash_key_ser}
+            if range_key_attribute:
+                request[range_key_attribute.attr_name] = range_key_ser
+            return request
+
+        def response_key(raw_item: Dict[str, Any]) -> Tuple[Any, Any]:
+            hash_key_ser = _unwrap_attribute_value(raw_item[hash_key_attribute.attr_name])
+            range_key_ser = None
+            if range_key_attribute:
+                range_key_ser = _unwrap_attribute_value(raw_item[range_key_attribute.attr_name])
+            return hash_key_ser, range_key_ser
+
+        found: Dict[Tuple[Any, Any], Dict[str, Any]] = {}
+        unknown: Set[Tuple[Any, Any]] = set()
+
+        for start in range(0, len(unique_keys), BATCH_GET_PAGE_LIMIT):
+            keys_to_get = [request_key(key) for key in unique_keys[start:start + BATCH_GET_PAGE_LIMIT]]
+            attempt = 0
+            while keys_to_get:
+                page, unprocessed_keys = cls._batch_get_page(
+                    keys_to_get,
+                    consistent_read=consistent_read,
+                    attributes_to_get=attributes_to_get,
+                )
+                for raw_item in page or []:
+                    found[response_key(raw_item)] = raw_item
+                if not unprocessed_keys:
+                    break
+                attempt += 1
+                if attempt > max_retries:
+                    log.warning("BatchGetItem retries exhausted; %d key(s) remain unprocessed",
+                                len(unprocessed_keys))
+                    for raw_key in unprocessed_keys:
+                        unknown.add(response_key(raw_key))
+                    break
+                time.sleep(min(0.05 * (2 ** attempt), 1.0))
+                keys_to_get = unprocessed_keys
+
+        results: List[Union[_T, BatchGetPlaceholder]] = []
+        for key in position_keys:
+            raw_item = found.get(key)
+            if raw_item is not None:
+                results.append(cls.from_raw_data(raw_item))
+            elif key in unknown:
+                results.append(BATCH_GET_UNKNOWN)
+            else:
+                results.append(BATCH_GET_NOT_FOUND)
+        return results
 
     @classmethod
     def batch_write(cls: Type[_T], auto_commit: bool = True) -> BatchWrite[_T]:
@@ -1120,6 +1238,26 @@ class Model(AttributeContainer, metaclass=MetaModel):
         if range_key is not None:
             range_key = cls._range_key_attribute().serialize(range_key)
         return hash_key, range_key
+
+    @classmethod
+    def _serialize_batch_get_key(cls, item: Union[_KeyType, Iterable[_KeyType]]) -> Tuple[Any, Any]:
+        """
+        Validates and serializes a single batch get key, returning the
+        (hash key, range key) serialized pair. The range key is None for
+        models without a range key attribute.
+        """
+        if cls._range_key_attribute():
+            if isinstance(item, str):
+                raise ValueError(f'Invalid key value {item!r}: '
+                                 'expected non-str iterable with exactly 2 elements (hash key, range key)')
+            try:
+                hash_key, range_key = item
+            except (TypeError, ValueError):
+                raise ValueError(f'Invalid key value {item!r}: '
+                                 'expected iterable with exactly 2 elements (hash key, range key)')
+            return cls._serialize_keys(hash_key, range_key)
+        hash_key_ser, _ = cls._serialize_keys(item)
+        return hash_key_ser, None
 
     def serialize(self, null_check: bool = True) -> Dict[str, Dict[str, Any]]:
         """
