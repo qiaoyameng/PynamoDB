@@ -1,6 +1,7 @@
 """
 DynamoDB Models for PynamoDB
 """
+from enum import Enum
 import random
 import time
 import logging
@@ -64,6 +65,81 @@ _KeyType = Any
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
+
+
+class BatchGetStatus(Enum):
+    """
+    The outcome of a single key lookup in :meth:`Model.batch_get_ordered`.
+    """
+    FOUND = 'found'
+    NOT_FOUND = 'not_found'
+    UNKNOWN = 'unknown'
+
+
+class BatchGetResult(Generic[_T]):
+    """
+    The result of a single position in :meth:`Model.batch_get_ordered`.
+
+    ``status`` is one of :class:`BatchGetStatus`:
+
+    * ``FOUND``: ``item`` holds a model instance.
+    * ``NOT_FOUND``: the key was fetched and DynamoDB returned no item for it.
+    * ``UNKNOWN``: the key was still unprocessed when the retry budget was
+      exhausted, so it is not known whether the item exists.
+    """
+    __slots__ = ('status', 'item')
+
+    def __init__(self, status: BatchGetStatus, item: Optional[_T] = None) -> None:
+        self.status = status
+        self.item = item
+
+    @property
+    def found(self) -> bool:
+        return self.status is BatchGetStatus.FOUND
+
+    def __eq__(self, other: Any) -> Any:
+        if not isinstance(other, BatchGetResult):
+            return NotImplemented
+        return self.status is other.status and self.item == other.item
+
+    def __repr__(self) -> str:
+        if self.found:
+            return f'BatchGetResult(BatchGetStatus.FOUND, item={self.item!r})'
+        return f'BatchGetResult(BatchGetStatus.{self.status.name})'
+
+
+def _freeze_attribute_value(value: Any) -> Any:
+    """
+    Converts a (possibly nested) DynamoDB attribute value into a hashable,
+    canonical form suitable for key equality checks.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted(
+            ((k, _freeze_attribute_value(v)) for k, v in value.items()),
+            key=lambda pair: pair[0],
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_attribute_value(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_attribute_value(v) for v in value)
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _batch_get_key_token(key_map: Mapping[str, Any]) -> Tuple:
+    """
+    Builds a hashable token for a DynamoDB key (a mapping of attribute name to
+    ``{attribute_type: serialized_value}``) so that requested keys, returned
+    items and unprocessed keys can be matched regardless of ordering.
+    """
+    return tuple(sorted(
+        ((attr_name, _freeze_attribute_value(attribute_value))
+         for attr_name, attribute_value in key_map.items()),
+        key=lambda pair: pair[0],
+    ))
 
 
 class BatchWrite(Generic[_T]):
@@ -380,6 +456,137 @@ class Model(AttributeContainer, metaclass=MetaModel):
                 keys_to_get = unprocessed_keys
             else:
                 keys_to_get = []
+
+    @classmethod
+    def batch_get_ordered(
+        cls: Type[_T],
+        items: Iterable[Union[_KeyType, Iterable[_KeyType]]],
+        consistent_read: Optional[bool] = None,
+        attributes_to_get: Optional[Sequence[str]] = None,
+        max_retries: int = 3,
+    ) -> List[BatchGetResult[_T]]:
+        """
+        BatchGetItem for this model, preserving the order of the requested keys.
+
+        Unlike :meth:`batch_get`, the returned list has exactly one
+        :class:`BatchGetResult` per requested key, at the same position:
+
+        * ``BatchGetStatus.FOUND`` with a freshly instantiated model,
+        * ``BatchGetStatus.NOT_FOUND`` when DynamoDB returned no item,
+        * ``BatchGetStatus.UNKNOWN`` when the key was still unprocessed after
+          ``max_retries`` additional attempts (it is *not* reported as
+          missing).
+
+        Duplicate keys are allowed. Keys are deduplicated by their serialized
+        form (so custom attribute serialization and composite keys participate
+        in the equality check) and each distinct key is only requested once.
+        Positions that refer to equal keys yield equal results, but each
+        position gets its own model instance.
+
+        :param items: Should be a list of hash keys to retrieve, or a list of
+            tuples if range keys are used.
+        :param consistent_read: Whether or not this needs to be consistent
+        :param attributes_to_get: A list of attributes to return. The key
+            attributes are always added to the projection so that returned
+            items can be matched back to their requested positions.
+        :param max_retries: How many additional times unprocessed keys are
+            re-requested before being reported as ``UNKNOWN``.
+        """
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        items = list(items)
+        hash_key_attribute = cls._hash_key_attribute()
+        range_key_attribute = cls._range_key_attribute()
+
+        if attributes_to_get is not None:
+            # Key attributes are not automatically included in a projection,
+            # but they are needed to match returned items to requested keys.
+            attributes_to_get = list(attributes_to_get)
+            for key_name in (cls._hash_keyname, cls._range_keyname):
+                if key_name is not None and key_name not in attributes_to_get:
+                    attributes_to_get.append(key_name)
+
+        # Serialize every requested key and group positions by serialized key
+        # equality, so that duplicates are only requested once.
+        position_tokens: List[Tuple] = []
+        unique_tokens: List[Tuple] = []
+        unique_keys: List[Dict[str, Any]] = []
+        token_to_unique_index: Dict[Tuple, int] = {}
+        for item in items:
+            if range_key_attribute:
+                if isinstance(item, str):
+                    raise ValueError(f'Invalid key value {item!r}: '
+                                     'expected non-str iterable with exactly 2 elements (hash key, range key)')
+                try:
+                    hash_key, range_key = item
+                except (TypeError, ValueError):
+                    raise ValueError(f'Invalid key value {item!r}: '
+                                     'expected iterable with exactly 2 elements (hash key, range key)')
+            else:
+                hash_key, range_key = item, None
+            hash_key_ser, range_key_ser = cls._serialize_keys(hash_key, range_key)
+            key_to_get = {hash_key_attribute.attr_name: hash_key_ser}
+            key_map: Dict[str, Any] = {
+                hash_key_attribute.attr_name: {hash_key_attribute.attr_type: hash_key_ser},
+            }
+            if range_key_attribute:
+                key_to_get[range_key_attribute.attr_name] = range_key_ser
+                key_map[range_key_attribute.attr_name] = {range_key_attribute.attr_type: range_key_ser}
+            token = _batch_get_key_token(key_map)
+            position_tokens.append(token)
+            if token not in token_to_unique_index:
+                token_to_unique_index[token] = len(unique_tokens)
+                unique_tokens.append(token)
+                unique_keys.append(key_to_get)
+
+        key_attr_names = [hash_key_attribute.attr_name]
+        if range_key_attribute:
+            key_attr_names.append(range_key_attribute.attr_name)
+
+        found_raw: Dict[Tuple, Dict[str, Any]] = {}
+        unknown_tokens: set = set()
+        pending: List[int] = list(range(len(unique_keys)))
+        retries_left = max_retries
+        while pending:
+            next_pending: List[int] = []
+            for page_start in range(0, len(pending), BATCH_GET_PAGE_LIMIT):
+                page_indices = pending[page_start:page_start + BATCH_GET_PAGE_LIMIT]
+                page, unprocessed_keys = cls._batch_get_page(
+                    [unique_keys[i] for i in page_indices],
+                    consistent_read=consistent_read,
+                    attributes_to_get=attributes_to_get,
+                )
+                for raw_item in page or []:
+                    token = _batch_get_key_token(
+                        {name: raw_item[name] for name in key_attr_names if name in raw_item}
+                    )
+                    if token in token_to_unique_index:
+                        found_raw[token] = raw_item
+                if unprocessed_keys:
+                    unprocessed_tokens = {_batch_get_key_token(key) for key in unprocessed_keys}
+                    for i in page_indices:
+                        if unique_tokens[i] in unprocessed_tokens:
+                            next_pending.append(i)
+            if not next_pending:
+                break
+            if retries_left == 0:
+                unknown_tokens = {unique_tokens[i] for i in next_pending}
+                break
+            retries_left -= 1
+            pending = next_pending
+
+        results: List[BatchGetResult[_T]] = []
+        for token in position_tokens:
+            raw_item = found_raw.get(token)
+            if raw_item is not None:
+                # Instantiate per position so that duplicate keys never share
+                # a mutable model instance.
+                results.append(BatchGetResult(BatchGetStatus.FOUND, cls.from_raw_data(raw_item)))
+            elif token in unknown_tokens:
+                results.append(BatchGetResult(BatchGetStatus.UNKNOWN))
+            else:
+                results.append(BatchGetResult(BatchGetStatus.NOT_FOUND))
+        return results
 
     @classmethod
     def batch_write(cls: Type[_T], auto_commit: bool = True) -> BatchWrite[_T]:

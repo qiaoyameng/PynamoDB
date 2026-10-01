@@ -53,6 +53,30 @@ Here is an example using an iterator for retrieving items in bulk:
     for item in Thread.batch_get(item_keys):
         print(item)
 
+Note that :meth:`~pynamodb.models.Model.batch_get` yields items in whatever order DynamoDB
+returns them, silently drops duplicate keys, and retries unprocessed keys forever.
+If you need the results aligned with the requested keys, use
+:meth:`~pynamodb.models.Model.batch_get_ordered` instead. It returns one
+:class:`~pynamodb.models.BatchGetResult` per requested key, at the same position:
+
+.. code-block:: python
+
+    from pynamodb.models import BatchGetStatus
+
+    item_keys = [('forum-1', 'subject-1'), ('forum-2', 'subject-2'), ('forum-1', 'subject-1')]
+    for key, result in zip(item_keys, Thread.batch_get_ordered(item_keys)):
+        if result.status is BatchGetStatus.FOUND:
+            print(result.item)
+        elif result.status is BatchGetStatus.NOT_FOUND:
+            print(f'{key} does not exist')
+        else:  # BatchGetStatus.UNKNOWN
+            print(f'{key} could not be fetched')
+
+Duplicate keys are deduplicated by their serialized form and only fetched once; each
+position still gets its own model instance. Unprocessed keys are retried a bounded
+number of times (``max_retries``, default 3) and reported as ``UNKNOWN`` -- never as
+missing -- once the budget is exhausted.
+
 Query Filters
 ^^^^^^^^^^^^^
 

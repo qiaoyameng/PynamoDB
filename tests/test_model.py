@@ -18,7 +18,7 @@ from pynamodb.exceptions import DoesNotExist, TableError, PutError, AttributeDes
 from pynamodb.constants import (
     ITEM, STRING, ALL, KEYS_ONLY, INCLUDE, REQUEST_ITEMS, UNPROCESSED_KEYS, CAMEL_COUNT,
     RESPONSES, KEYS, ITEMS, LAST_EVALUATED_KEY, EXCLUSIVE_START_KEY, ATTRIBUTES, BINARY,
-    UNPROCESSED_ITEMS, DEFAULT_ENCODING, MAP, LIST, NUMBER, SCANNED_COUNT,
+    UNPROCESSED_ITEMS, DEFAULT_ENCODING, MAP, LIST, NUMBER, SCANNED_COUNT, BATCH_GET_ITEM,
 )
 from pynamodb.models import Model
 from pynamodb.indexes import (
@@ -461,6 +461,77 @@ class VersionedModel(Model):
     name = UnicodeAttribute(hash_key=True)
     email = UnicodeAttribute()
     version = VersionAttribute()
+
+
+class LowerCaseUnicodeAttribute(UnicodeAttribute):
+    """
+    A key attribute whose serialized form normalizes case, so that distinct
+    Python values can be equivalent keys.
+    """
+
+    def serialize(self, value):
+        return super().serialize(value).lower()
+
+
+class NormalizedKeyModel(Model):
+    """
+    A model whose hash key uses custom serialization
+    """
+
+    class Meta:
+        table_name = 'NormalizedKeyModel'
+
+    user_name = LowerCaseUnicodeAttribute(hash_key=True)
+    email = UnicodeAttribute(null=True)
+
+
+class BatchGetServiceStub:
+    """
+    A fake BatchGetItem endpoint.
+
+    Returns items out of order, keeps "flaky" keys in UnprocessedKeys for a
+    bounded number of rounds, omits unknown keys entirely (i.e. not found),
+    and records every requested key so tests can assert deduplication.
+    """
+
+    def __init__(self, table_name, key_attr_names):
+        self.table_name = table_name
+        self.key_attr_names = key_attr_names
+        self._items = {}
+        self._flaky = {}
+        self.requested_keys = []
+        self.call_count = 0
+
+    @staticmethod
+    def _token(key_map):
+        return json.dumps(key_map, sort_keys=True, default=str)
+
+    def add_item(self, raw_item, flaky_rounds=0):
+        token = self._token({name: raw_item[name] for name in self.key_attr_names})
+        self._items[token] = raw_item
+        if flaky_rounds:
+            self._flaky[token] = flaky_rounds
+
+    def __call__(self, operation_name, operation_kwargs):
+        assert operation_name == BATCH_GET_ITEM
+        self.call_count += 1
+        keys = operation_kwargs[REQUEST_ITEMS][self.table_name][KEYS]
+        self.requested_keys.extend(keys)
+        responses = []
+        unprocessed = []
+        for key in keys:
+            token = self._token(key)
+            if self._flaky.get(token, 0) > 0:
+                self._flaky[token] -= 1
+                unprocessed.append(key)
+            elif token in self._items:
+                responses.append(self._items[token])
+        # DynamoDB does not preserve request order
+        responses.reverse()
+        result = {RESPONSES: {self.table_name: responses}, UNPROCESSED_KEYS: {}}
+        if unprocessed:
+            result[UNPROCESSED_KEYS] = {self.table_name: {KEYS: unprocessed}}
+        return result
 
 
 class ModelTestCase(TestCase):
@@ -1953,6 +2024,177 @@ class ModelTestCase(TestCase):
                 )
             ):
                 _ = list(UserModel.batch_get([('a', 'b', 'c')]))
+
+    def test_batch_get_ordered(self):
+        """
+        Model.batch_get_ordered preserves input order, dedupes requests and
+        returns per-position results.
+        """
+        from pynamodb.models import BatchGetStatus
+
+        stub = BatchGetServiceStub('SimpleModel', ['user_name'])
+        for x in range(4):
+            stub.add_item({
+                'user_name': {'S': f'hash-{x}'},
+                'email': {'S': f'email-{x}'},
+            })
+
+        with patch(PATCH_METHOD, new=stub):
+            keys = ['hash-3', 'hash-1', 'missing', 'hash-3', 'hash-0']
+            results = SimpleUserModel.batch_get_ordered(keys)
+
+        self.assertEqual(len(results), len(keys))
+        self.assertEqual(
+            [r.status for r in results],
+            [
+                BatchGetStatus.FOUND,
+                BatchGetStatus.FOUND,
+                BatchGetStatus.NOT_FOUND,
+                BatchGetStatus.FOUND,
+                BatchGetStatus.FOUND,
+            ],
+        )
+        self.assertEqual(results[0].item.user_name, 'hash-3')
+        self.assertEqual(results[1].item.user_name, 'hash-1')
+        self.assertEqual(results[4].item.user_name, 'hash-0')
+        self.assertIsNone(results[2].item)
+
+        # duplicate keys are only requested once
+        self.assertEqual(stub.call_count, 1)
+        self.assertEqual(
+            sorted(BatchGetServiceStub._token(key) for key in stub.requested_keys),
+            sorted(BatchGetServiceStub._token({'user_name': {'S': key}}) for key in
+                   ['hash-0', 'hash-1', 'hash-3', 'missing']),
+        )
+
+        # duplicate positions get equal but independent model instances
+        self.assertIsNot(results[0].item, results[3].item)
+        self.assertEqual(results[0].item.attribute_values, results[3].item.attribute_values)
+        results[0].item.email = 'mutated'
+        self.assertEqual(results[3].item.email, 'email-3')
+
+    def test_batch_get_ordered__empty(self):
+        with patch(PATCH_METHOD) as req:
+            self.assertEqual(SimpleUserModel.batch_get_ordered([]), [])
+            req.assert_not_called()
+
+    def test_batch_get_ordered__unprocessed_retries(self):
+        """
+        Unprocessed keys are retried across rounds until they are returned.
+        """
+        from pynamodb.models import BatchGetStatus
+
+        stub = BatchGetServiceStub('UserModel', ['user_name', 'user_id'])
+        stub.add_item(
+            {'user_name': {'S': 'hash-0'}, 'user_id': {'S': '0'}, 'email': {'S': 'a'}},
+            flaky_rounds=2,
+        )
+        stub.add_item({'user_name': {'S': 'hash-1'}, 'user_id': {'S': '1'}})
+
+        with patch(PATCH_METHOD, new=stub):
+            results = UserModel.batch_get_ordered(
+                [('hash-0', '0'), ('hash-1', '1'), ('hash-0', '0')],
+                max_retries=3,
+            )
+
+        self.assertEqual([r.status for r in results], [BatchGetStatus.FOUND] * 3)
+        self.assertEqual(results[0].item.user_id, '0')
+        self.assertEqual(results[1].item.user_id, '1')
+        self.assertIsNot(results[0].item, results[2].item)
+        # one initial call plus two retry rounds for the flaky key
+        self.assertEqual(stub.call_count, 3)
+        requested_tokens = [BatchGetServiceStub._token(key) for key in stub.requested_keys]
+        flaky_token = BatchGetServiceStub._token({'user_name': {'S': 'hash-0'}, 'user_id': {'S': '0'}})
+        ok_token = BatchGetServiceStub._token({'user_name': {'S': 'hash-1'}, 'user_id': {'S': '1'}})
+        self.assertEqual(requested_tokens.count(flaky_token), 3)
+        self.assertEqual(requested_tokens.count(ok_token), 1)
+
+    def test_batch_get_ordered__unprocessed_exhausted(self):
+        """
+        Keys still unprocessed when the retry budget is exhausted are UNKNOWN,
+        not NOT_FOUND.
+        """
+        from pynamodb.models import BatchGetStatus
+
+        stub = BatchGetServiceStub('UserModel', ['user_name', 'user_id'])
+        stub.add_item(
+            {'user_name': {'S': 'hash-0'}, 'user_id': {'S': '0'}},
+            flaky_rounds=10,
+        )
+
+        with patch(PATCH_METHOD, new=stub):
+            results = UserModel.batch_get_ordered(
+                [('hash-0', '0'), ('missing', 'x')],
+                max_retries=2,
+            )
+
+        self.assertEqual(
+            [r.status for r in results],
+            [BatchGetStatus.UNKNOWN, BatchGetStatus.NOT_FOUND],
+        )
+        self.assertIsNone(results[0].item)
+        # one initial call plus two retry rounds
+        self.assertEqual(stub.call_count, 3)
+
+    def test_batch_get_ordered__unprocessed_no_retries(self):
+        from pynamodb.models import BatchGetStatus
+
+        stub = BatchGetServiceStub('SimpleModel', ['user_name'])
+        stub.add_item({'user_name': {'S': 'hash-0'}}, flaky_rounds=1)
+
+        with patch(PATCH_METHOD, new=stub):
+            results = SimpleUserModel.batch_get_ordered(['hash-0'], max_retries=0)
+
+        self.assertEqual([r.status for r in results], [BatchGetStatus.UNKNOWN])
+        self.assertEqual(stub.call_count, 1)
+
+    def test_batch_get_ordered__custom_serialization_dedupe(self):
+        """
+        Keys that serialize to the same value are equivalent and fetched once.
+        """
+        from pynamodb.models import BatchGetStatus
+
+        stub = BatchGetServiceStub('NormalizedKeyModel', ['user_name'])
+        stub.add_item({'user_name': {'S': 'abc'}, 'email': {'S': 'x'}})
+
+        with patch(PATCH_METHOD, new=stub):
+            results = NormalizedKeyModel.batch_get_ordered(['ABC', 'abc', 'Abc'])
+
+        self.assertEqual([r.status for r in results], [BatchGetStatus.FOUND] * 3)
+        self.assertEqual([r.item.user_name for r in results], ['abc'] * 3)
+        self.assertEqual(stub.call_count, 1)
+        self.assertEqual(len(stub.requested_keys), 1)
+        self.assertEqual(stub.requested_keys[0], {'user_name': {'S': 'abc'}})
+        self.assertIsNot(results[0].item, results[1].item)
+        self.assertIsNot(results[1].item, results[2].item)
+
+    def test_batch_get_ordered__attributes_to_get_includes_keys(self):
+        with patch(PATCH_METHOD) as req:
+            req.return_value = {RESPONSES: {'SimpleModel': []}, UNPROCESSED_KEYS: {}}
+            results = SimpleUserModel.batch_get_ordered(['hash-0'], attributes_to_get=['email'])
+            self.assertFalse(results[0].found)
+            args = req.call_args[0][1]
+            names = args['RequestItems']['SimpleModel']['ExpressionAttributeNames']
+            self.assertEqual(
+                sorted(names.values()),
+                ['email', 'user_name'],
+            )
+
+    def test_batch_get_ordered__range_key__invalid__string(self):
+        with patch(PATCH_METHOD) as req:
+            req.return_value = {
+                'UnprocessedKeys': {},
+                'Responses': {
+                    'UserModel': [],
+                }
+            }
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "Invalid key value 'ab': expected non-str iterable with exactly 2 elements (hash key, range key)"
+                )
+            ):
+                _ = UserModel.batch_get_ordered(['ab'])
 
     def test_batch_write(self):
         """
